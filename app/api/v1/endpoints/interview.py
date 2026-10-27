@@ -240,6 +240,74 @@ def create_stored_interview_session(
         ) from exc
     return _session_response(session)
 
+@router.post(
+    "/sessions/upload",
+    response_model=InterviewSessionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_session_from_upload(
+    cv_file: UploadFile | None = File(default=None),
+    cv_id: int | None = Form(default=None),
+    cv_text: str | None = Form(default=None),
+    job_id: int | None = Form(default=None),
+    jd_file: UploadFile | None = File(default=None),
+    jd_text: str | None = Form(default=None),
+    language: str = Form(default="vi"),
+    max_questions: int = Form(default=5),
+    allow_external_ai: bool = Form(default=True),
+    db: Session = Depends(get_db),
+) -> InterviewSessionResponse:
+    # 1. Resolve CV text from uploaded file or existing ID
+    final_cv_text = ""
+    if cv_file and cv_file.filename:
+        cv_bytes = await cv_file.read()
+        final_cv_text = CvIngestService.extract_text_from_file(cv_file.filename, cv_file.content_type, cv_bytes)
+    elif cv_text and len(cv_text.strip()) >= 30:
+        final_cv_text = cv_text.strip()
+    elif cv_id:
+        from app.models.cv import CV
+        cv_row = db.query(CV).filter(CV.cv_id == cv_id).first()
+        if cv_row:
+            final_cv_text, _ = StoredInterviewDemoService.load_cv_text(db, cv_row)
+
+    if not final_cv_text or len(final_cv_text) < 30:
+        raise HTTPException(status_code=400, detail="Vui lòng tải lên file CV (PDF/DOCX/TXT) hoặc chọn một CV hợp lệ")
+
+    # 2. Resolve JD text from uploaded file, custom text, or existing job_id
+    final_jd_text = ""
+    if jd_file and jd_file.filename:
+        jd_bytes = await jd_file.read()
+        final_jd_text = CvIngestService.extract_text_from_file(jd_file.filename, jd_file.content_type, jd_bytes)
+    elif jd_text and len(jd_text.strip()) >= 30:
+        final_jd_text = jd_text.strip()
+    elif job_id:
+        from app.models.job import Job
+        job_row = db.query(Job).filter(Job.job_id == job_id).first()
+        if job_row:
+            final_jd_text = StoredInterviewDemoService.build_job_text(job_row)
+
+    if not final_jd_text or len(final_jd_text) < 30:
+        raise HTTPException(status_code=400, detail="Vui lòng chọn vị trí tuyển dụng hoặc nhập/tải lên mô tả công việc (JD)")
+
+    # 3. Create interview session using custom CV and JD text
+    try:
+        session = InterviewSessionService.create(
+            db=db,
+            cv_text=final_cv_text,
+            jd_text=final_jd_text,
+            language=language,
+            max_questions=max_questions,
+            allow_external_ai=allow_external_ai,
+            research_consent=False,
+            context_source="user_upload",
+        )
+    except (ValueError, SQLAlchemyError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Lỗi khởi tạo phiên phỏng vấn: {exc}") from exc
+
+    return _session_response(session)
+
+
 
 @router.post(
     "/sessions",
