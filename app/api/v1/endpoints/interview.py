@@ -271,6 +271,57 @@ def create_interview_session(
 
 
 @router.post(
+    "/sessions/files",
+    response_model=InterviewSessionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_interview_session_from_cv_file(
+    cv_file: UploadFile = File(..., description="CV: PDF, DOCX, TXT, or MD"),
+    jd_text: str = Form(..., min_length=30),
+    language: str = Form(default="vi"),
+    max_questions: int = Form(default=8, ge=5, le=15),
+    allow_external_ai: bool = Form(default=True),
+    research_consent: bool = Form(default=False),
+    db: Session = Depends(get_db),
+) -> InterviewSessionResponse:
+    """Create an adaptive interview directly from an uploaded CV and JD text."""
+    normalized_language = language.strip().lower()
+    if normalized_language not in {"vi", "en"}:
+        raise HTTPException(status_code=400, detail="language must be 'vi' or 'en'")
+
+    try:
+        cv_bytes = await cv_file.read()
+        cv_text = CvIngestService.extract_text_from_file(
+            cv_file.filename or "cv",
+            cv_file.content_type,
+            cv_bytes,
+        )
+        session = InterviewSessionService.create(
+            db=db,
+            cv_text=cv_text,
+            jd_text=jd_text,
+            language=normalized_language,
+            max_questions=max_questions,
+            allow_external_ai=allow_external_ai,
+            research_consent=research_consent,
+        )
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create interview session: {exc}",
+        ) from exc
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to read CV file: {exc}") from exc
+
+    return _session_response(session)
+
+
+@router.post(
     "/synthetic-sessions",
     response_model=InterviewSessionResponse,
     status_code=status.HTTP_201_CREATED,
