@@ -268,25 +268,31 @@ class CvIngestService:
 			return 0.65
 		return 0.5
 
+	_skill_candidates_cache: list[str] | None = None
+	_skill_alias_lookup_cache: dict[str, str] | None = None
+
 	@staticmethod
 	def _collect_skill_candidates(db: Session) -> list[str]:
+		if CvIngestService._skill_candidates_cache is not None:
+			return CvIngestService._skill_candidates_cache
 		try:
 			skill_names = [
 				item.name
 				for item in db.query(Skill).all()
 				if item.name and not is_non_skill_role_label(item.name)
 			]
+			if skill_names:
+				CvIngestService._skill_candidates_cache = skill_names
+				return skill_names
 		except SQLAlchemyError as exc:
 			db.rollback()
 			print(f"--- SKILL CANDIDATE DB FALLBACK: {exc} ---")
-			return CvIngestService._fallback_skills
-
-		if skill_names:
-			return skill_names
 		return CvIngestService._fallback_skills
 
 	@staticmethod
 	def _collect_skill_alias_lookup(db: Session, skill_candidates: list[str]) -> dict[str, str]:
+		if CvIngestService._skill_alias_lookup_cache is not None:
+			return CvIngestService._skill_alias_lookup_cache
 		lookup: dict[str, str] = {}
 
 		try:
@@ -312,25 +318,25 @@ class CvIngestService:
 				if canonical_key:
 					lookup.setdefault(canonical_key, canonical_name)
 
+		if not lookup:
+			for name in skill_candidates:
+				key = normalize_skill_key(name)
+				if key:
+					lookup.setdefault(key, name)
+				canonical_key = canonicalize_skill_key(name)
+				if canonical_key:
+					lookup.setdefault(canonical_key, name)
+
+				for alias in get_skill_aliases(name):
+					alias_key = normalize_skill_key(alias)
+					if alias_key:
+						lookup.setdefault(alias_key, name)
+					canonical_alias_key = canonicalize_skill_key(alias)
+					if canonical_alias_key:
+						lookup.setdefault(canonical_alias_key, name)
+
 		if lookup:
-			return lookup
-
-		for name in skill_candidates:
-			key = normalize_skill_key(name)
-			if key:
-				lookup.setdefault(key, name)
-			canonical_key = canonicalize_skill_key(name)
-			if canonical_key:
-				lookup.setdefault(canonical_key, name)
-
-			for alias in get_skill_aliases(name):
-				alias_key = normalize_skill_key(alias)
-				if alias_key:
-					lookup.setdefault(alias_key, name)
-				canonical_alias_key = canonicalize_skill_key(alias)
-				if canonical_alias_key:
-					lookup.setdefault(canonical_alias_key, name)
-
+			CvIngestService._skill_alias_lookup_cache = lookup
 		return lookup
 
 	@staticmethod

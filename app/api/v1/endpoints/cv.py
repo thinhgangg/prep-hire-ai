@@ -246,61 +246,84 @@ def _fallback_cv_review(match_result, gap_result, roadmap_result) -> dict:
     }
 
 
+_analysis_table_ensured = False
+
+
 def _ensure_analysis_table() -> None:
-    Base.metadata.create_all(
-        bind=engine,
-        tables=[
-            CvAnalysisResult.__table__,
-            CvSkill.__table__,
-            JobUpload.__table__,
-            SkillGap.__table__,
-        ],
-    )
-    with engine.begin() as connection:
-        connection.execute(text("ALTER TABLE cv_analysis_results ADD COLUMN IF NOT EXISTS ai_review_json JSON"))
-        connection.execute(text("ALTER TABLE cv_analysis_results ADD COLUMN IF NOT EXISTS job_upload_id INTEGER"))
-        connection.execute(text("ALTER TABLE cv_analysis_results ALTER COLUMN job_job_id DROP NOT NULL"))
-        connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS company_name VARCHAR(255)"))
-        connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS level VARCHAR(50)"))
-        connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS employment_type VARCHAR(50)"))
-        connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS experience VARCHAR(50)"))
-        connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS application_deadline DATE"))
-        connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS location VARCHAR(255)"))
-        connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS salary_min INTEGER"))
-        connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS salary_max INTEGER"))
-        connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS currency VARCHAR(10)"))
-        connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS description_raw TEXT"))
-        connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS description_clean TEXT"))
-        connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS role_responsibilities TEXT"))
-        connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS skills_qualifications TEXT"))
-        connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS benefits TEXT"))
-        connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS source_url VARCHAR(1000)"))
-        connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS source_site VARCHAR(100)"))
-        connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS posted_at TIMESTAMP WITH TIME ZONE"))
-        connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS status VARCHAR(50)"))
-        connection.execute(text("UPDATE job_uploads SET description_raw = COALESCE(description_raw, content_excerpt, '')"))
-        connection.execute(text("UPDATE job_uploads SET source_site = COALESCE(source_site, 'upload')"))
-        connection.execute(text("UPDATE job_uploads SET status = COALESCE(status, 'uploaded')"))
+    global _analysis_table_ensured
+    if _analysis_table_ensured:
+        return
+    _analysis_table_ensured = True
+    try:
+        Base.metadata.create_all(
+            bind=engine,
+            tables=[
+                CvAnalysisResult.__table__,
+                CvSkill.__table__,
+                JobUpload.__table__,
+                SkillGap.__table__,
+            ],
+        )
+        with engine.begin() as connection:
+            connection.execute(text("SET statement_timeout = 3000"))
+            connection.execute(text("ALTER TABLE cv_analysis_results ADD COLUMN IF NOT EXISTS ai_review_json JSON"))
+            connection.execute(text("ALTER TABLE cv_analysis_results ADD COLUMN IF NOT EXISTS job_upload_id INTEGER"))
+            connection.execute(text("ALTER TABLE cv_analysis_results ALTER COLUMN job_job_id DROP NOT NULL"))
+            connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS company_name VARCHAR(255)"))
+            connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS level VARCHAR(50)"))
+            connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS employment_type VARCHAR(50)"))
+            connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS experience VARCHAR(50)"))
+            connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS application_deadline DATE"))
+            connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS location VARCHAR(255)"))
+            connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS salary_min INTEGER"))
+            connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS salary_max INTEGER"))
+            connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS currency VARCHAR(10)"))
+            connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS description_raw TEXT"))
+            connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS description_clean TEXT"))
+            connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS role_responsibilities TEXT"))
+            connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS skills_qualifications TEXT"))
+            connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS benefits TEXT"))
+            connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS source_url VARCHAR(1000)"))
+            connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS source_site VARCHAR(100)"))
+            connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS posted_at TIMESTAMP WITH TIME ZONE"))
+            connection.execute(text("ALTER TABLE job_uploads ADD COLUMN IF NOT EXISTS status VARCHAR(50)"))
+    except Exception as exc:
+        print(f"[WARN] _ensure_analysis_table non-fatal schema check: {exc}")
 
 
-def _build_skill_lookup(db: Session) -> tuple[dict[str, Skill], dict[str, Skill]]:
-    skills = db.query(Skill).all()
-    by_name: dict[str, Skill] = {}
-    by_alias: dict[str, Skill] = {}
+_skill_lookup_cache: tuple[dict[str, int], dict[str, int]] | None = None
 
-    for skill in skills:
-        if not skill.name:
+
+def _build_skill_lookup(db: Session) -> tuple[dict[str, int], dict[str, int]]:
+    global _skill_lookup_cache
+    if _skill_lookup_cache is not None:
+        return _skill_lookup_cache
+
+    try:
+        skills = db.query(Skill.skill_id, Skill.name, Skill.aliases).all()
+    except Exception as exc:
+        db.rollback()
+        print(f"[WARN] _build_skill_lookup fallback: {exc}")
+        skills = []
+
+    by_name: dict[str, int] = {}
+    by_alias: dict[str, int] = {}
+
+    for s_id, s_name, s_aliases in skills:
+        if not s_name:
             continue
-        name_key = normalize_skill_key(skill.name)
+        name_key = normalize_skill_key(s_name)
         if name_key:
-            by_name[name_key] = skill
+            by_name[name_key] = s_id
 
-        aliases = skill.aliases or []
+        aliases = s_aliases or []
         for alias in aliases:
             alias_key = normalize_skill_key(alias)
             if alias_key and alias_key not in by_alias:
-                by_alias[alias_key] = skill
+                by_alias[alias_key] = s_id
 
+    if by_name or by_alias:
+        _skill_lookup_cache = (by_name, by_alias)
     return by_name, by_alias
 
 
@@ -465,20 +488,20 @@ def _persist_analysis_details(
             continue
 
         key = normalize_skill_key(raw_name)
-        matched_skill = skill_by_name.get(key)
+        matched_skill_id = skill_by_name.get(key)
         confidence = 1.0
 
-        if not matched_skill:
-            matched_skill = skill_by_alias.get(key)
-            confidence = 0.7 if matched_skill else 0.5
+        if not matched_skill_id:
+            matched_skill_id = skill_by_alias.get(key)
+            confidence = 0.7 if matched_skill_id else 0.5
 
-        if not matched_skill:
+        if not matched_skill_id:
             continue
 
         cv_rows.append(
             CvSkill(
                 analysis_id=analysis_id,
-                skill_id=matched_skill.skill_id,
+                skill_id=matched_skill_id,
                 confidence=confidence,
                 source="regex",
             )
@@ -491,25 +514,25 @@ def _persist_analysis_details(
 
     for item in gap_result.skillGap.missing:
         skill_name = normalize_skill_key(item.skill)
-        matched_skill = skill_by_name.get(skill_name) or skill_by_alias.get(skill_name)
-        if not matched_skill:
+        matched_skill_id = skill_by_name.get(skill_name) or skill_by_alias.get(skill_name)
+        if not matched_skill_id:
             continue
 
         priority = _label_to_priority(item.importance)
         gap_row = SkillGap(
             analysis_id=analysis_id,
-            skill_id=matched_skill.skill_id,
+            skill_id=matched_skill_id,
             priority_score=priority,
             gap_reason=item.reason,
         )
-        existing = gap_rows_by_skill.get(matched_skill.skill_id)
+        existing = gap_rows_by_skill.get(matched_skill_id)
         if not existing or gap_row.priority_score > existing.priority_score:
-            gap_rows_by_skill[matched_skill.skill_id] = gap_row
+            gap_rows_by_skill[matched_skill_id] = gap_row
 
     for item in gap_result.skillGap.weak:
         skill_name = normalize_skill_key(item.skill)
-        matched_skill = skill_by_name.get(skill_name) or skill_by_alias.get(skill_name)
-        if not matched_skill:
+        matched_skill_id = skill_by_name.get(skill_name) or skill_by_alias.get(skill_name)
+        if not matched_skill_id:
             continue
 
         priority = _weak_gap_priority(
@@ -520,14 +543,14 @@ def _persist_analysis_details(
         reason = f"Current {item.current_proficiency:.2f}, required {item.required_proficiency:.2f}, gap {item.gap:.2f}"
         gap_row = SkillGap(
             analysis_id=analysis_id,
-            skill_id=matched_skill.skill_id,
+            skill_id=matched_skill_id,
             priority_score=priority,
             gap_reason=reason,
         )
 
-        existing = gap_rows_by_skill.get(matched_skill.skill_id)
+        existing = gap_rows_by_skill.get(matched_skill_id)
         if not existing or gap_row.priority_score > existing.priority_score:
-            gap_rows_by_skill[matched_skill.skill_id] = gap_row
+            gap_rows_by_skill[matched_skill_id] = gap_row
 
     if gap_rows_by_skill:
         db.add_all(list(gap_rows_by_skill.values()))

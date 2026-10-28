@@ -13,6 +13,35 @@ from app.core.config import settings
 class AIService:
 	MODEL_NAME = settings.GEMINI_MODEL
 
+	_gemini_quota_exhausted: bool = False
+
+	@staticmethod
+	def _generate_content_safe(prompt: str, timeout: float = 3.5) -> str:
+		if AIService._gemini_quota_exhausted:
+			return ""
+		import concurrent.futures
+		try:
+			client = AIService._build_client()
+			with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+				future = executor.submit(
+					client.models.generate_content,
+					model=AIService.MODEL_NAME,
+					contents=prompt,
+				)
+				response = future.result(timeout=timeout)
+				return (response.text or "").strip() if response else ""
+		except concurrent.futures.TimeoutError:
+			print(f"[WARN] Gemini call timed out after {timeout}s - using fast fallback")
+			return ""
+		except Exception as exc:
+			err_str = str(exc)
+			if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower() or "503" in err_str:
+				print(f"[INFO] Gemini API tạm hết quota hoặc đang quá tải (429/503). Hệ thống tự động chuyển sang Mô hình ML cục bộ siêu tốc!")
+				AIService._gemini_quota_exhausted = True
+			else:
+				print(f"[WARN] Gemini call failed ({exc}) - using fast fallback")
+			return ""
+
 	@staticmethod
 	def _build_client() -> genai.Client:
 		return genai.Client(
@@ -100,23 +129,11 @@ class AIService:
 			f"CV text:\n{limited_text}"
 		)
 
-		try:
-			client = AIService._build_client()
-			response = client.models.generate_content(
-				model=AIService.MODEL_NAME,
-				contents=prompt,
-			)
-			text = (response.text or "").strip() if response else ""
-			if not text:
-				return None
-
-			data = AIService._extract_json(text)
-			if not data:
-				return None
-			return data
-		except Exception as exc:
-			print(f"--- CV AI ENRICHMENT ERROR: {exc} ---")
+		text = AIService._generate_content_safe(prompt, timeout=6.0)
+		if not text:
 			return None
+		data = AIService._extract_json(text)
+		return data if data else None
 
 	@staticmethod
 	def extract_text_from_image(file_bytes: bytes, content_type: str | None = None) -> str | None:
@@ -208,23 +225,11 @@ class AIService:
 			f"Uploaded JD text:\n{limited_text}"
 		)
 
-		try:
-			client = AIService._build_client()
-			response = client.models.generate_content(
-				model=AIService.MODEL_NAME,
-				contents=prompt,
-			)
-			text = (response.text or "").strip() if response else ""
-			if not text:
-				return None
-
-			data = AIService._extract_json(text)
-			if not data:
-				return None
-			return data
-		except Exception as exc:
-			print(f"--- JOB AI ENRICHMENT ERROR: {exc} ---")
+		text = AIService._generate_content_safe(prompt, timeout=6.0)
+		if not text:
 			return None
+		data = AIService._extract_json(text)
+		return data if data else None
 
 	@staticmethod
 	def generate_cv_job_review(
@@ -271,34 +276,25 @@ class AIService:
 			f"CV excerpt:\n{limited_cv}"
 		)
 
-		try:
-			client = AIService._build_client()
-			response = client.models.generate_content(
-				model=AIService.MODEL_NAME,
-				contents=prompt,
-			)
-			text = (response.text or "").strip() if response else ""
-			data = AIService._extract_json(text)
-			if not data:
-				return None
-
-			def clean_list(value: Any) -> list[str]:
-				if not isinstance(value, list):
-					return []
-				return [str(item).strip() for item in value[:4] if str(item).strip()]
-
-			verdict = str(data.get("verdict") or "").strip()
-			if verdict not in {"strong_match", "potential_match", "weak_match"}:
-				verdict = "potential_match"
-
-			return {
-				"summary": str(data.get("summary") or "").strip()[:800],
-				"strengths": clean_list(data.get("strengths")),
-				"concerns": clean_list(data.get("concerns")),
-				"recommendations": clean_list(data.get("recommendations")),
-				"verdict": verdict,
-				"source": "ai",
-			}
-		except Exception as exc:
-			print(f"--- CV JOB AI REVIEW ERROR: {exc} ---")
+		text = AIService._generate_content_safe(prompt, timeout=6.0)
+		data = AIService._extract_json(text) if text else None
+		if not data:
 			return None
+
+		def clean_list(value: Any) -> list[str]:
+			if not isinstance(value, list):
+				return []
+			return [str(item).strip() for item in value[:4] if str(item).strip()]
+
+		verdict = str(data.get("verdict") or "").strip()
+		if verdict not in {"strong_match", "potential_match", "weak_match"}:
+			verdict = "potential_match"
+
+		return {
+			"summary": str(data.get("summary") or "").strip()[:800],
+			"strengths": clean_list(data.get("strengths")),
+			"concerns": clean_list(data.get("concerns")),
+			"recommendations": clean_list(data.get("recommendations")),
+			"verdict": verdict,
+			"source": "ai",
+		}
