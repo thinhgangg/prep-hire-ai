@@ -27,6 +27,7 @@ from app.services.interview_evidence_aggregation_service import (
     InterviewEvidenceSummaryService,
 )
 from app.services.pdf_processor import CvIngestService
+from app.services.tts_prewarm_service import tts_prewarm_service
 
 
 PROMPT_VERSION = "interview-question-v1"
@@ -843,6 +844,7 @@ class InterviewSessionService:
         db.add(session)
         db.flush()
         first_turn = InterviewSessionService.new_turn(session, 0)
+        tts_prewarm_service.prewarm(first_turn.question_text)
         session.turns.append(first_turn)
         session.current_stage = first_turn.stage
         db.commit()
@@ -888,6 +890,7 @@ class InterviewSessionService:
         else:
             db.flush()
             next_turn = InterviewSessionService.new_turn(session, next_index)
+            tts_prewarm_service.prewarm(next_turn.question_text)
             session.turns.append(next_turn)
             session.current_turn_index = next_index
             session.current_stage = next_turn.stage

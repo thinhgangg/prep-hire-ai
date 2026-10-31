@@ -61,6 +61,7 @@ Thumbs.db
 # Project specific
 chromedriver.exe
 *.txt~
+node_modules/
 
 # Trained research artifacts (reproducible from annotated datasets)
 artifacts/*.joblib

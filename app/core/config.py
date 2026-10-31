@@ -117,6 +117,9 @@ class Settings(BaseSettings):
     CV_AI_ENRICHMENT_ENABLED: bool = True
     INTERVIEW_MULTI_PROVIDER_ENABLED: bool = True
     INTERVIEW_QUESTION_CANDIDATE_COUNT: int = 4
+    TTS_PREWARM_ENABLED: bool = True
+    TTS_PREWARM_URL: str = "http://localhost:8000/api/v1/tts/prewarm"
+    TTS_PREWARM_NOTIFY_TIMEOUT_SECONDS: float = 3.0
     INTERVIEW_QUESTION_RANKER_ARTIFACT: str = (
         "artifacts/weak_supervision/v1_1/question_pairwise_ranker_v2.joblib"
     )
