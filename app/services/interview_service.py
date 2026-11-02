@@ -270,7 +270,7 @@ class AdaptiveQuestionEngine:
         started_at = time.perf_counter()
         data: dict[str, Any] | None = None
 
-        selected_identity = provider or model_name or "inception"
+        selected_identity = provider or model_name or "groq"
         selected_model = model_name
         selected_provider = provider
         if allow_external_ai and settings.CV_AI_ENRICHMENT_ENABLED:

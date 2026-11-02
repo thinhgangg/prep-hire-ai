@@ -19,5 +19,11 @@ services:
         value: 1h
       - key: CORS_ORIGINS
         sync: false
-      - key: GEMINI_API_KEY
+      - key: GROQ_API_KEY
         sync: false
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      - key: CV_AI_ENRICHMENT_ENABLED
+        value: "true"
+      - key: INTERVIEW_MULTI_PROVIDER_ENABLED
+        value: "false"
