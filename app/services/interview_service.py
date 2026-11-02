@@ -852,6 +852,16 @@ class InterviewSessionService:
         return session
 
     @staticmethod
+    def list_for_user(db: Session, user_id: int, limit: int = 30) -> list[InterviewSession]:
+        return (
+            db.query(InterviewSession)
+            .filter(InterviewSession.user_id == user_id)
+            .order_by(InterviewSession.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+
+    @staticmethod
     def get(db: Session, session_id: str, lock: bool = False) -> InterviewSession | None:
         query = db.query(InterviewSession).filter(InterviewSession.session_id == session_id)
         return query.with_for_update().first() if lock else query.first()

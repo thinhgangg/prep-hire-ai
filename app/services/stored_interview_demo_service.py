@@ -174,6 +174,7 @@ class StoredInterviewDemoService:
         language: str,
         max_questions: int,
         allow_external_ai: bool,
+        user_id: int | None = None,
     ):
         cv = db.query(CV).filter(CV.cv_id == cv_id).first()
         if not cv:
@@ -191,7 +192,7 @@ class StoredInterviewDemoService:
             max_questions=max_questions,
             allow_external_ai=allow_external_ai,
             research_consent=False,
-            user_id=cv.user_user_id,
+            user_id=user_id if user_id is not None else cv.user_user_id,
             context_source="stored_cv_job",
             source_cv_id=cv.cv_id,
             source_job_id=job.job_id,

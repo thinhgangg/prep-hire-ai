@@ -227,6 +227,7 @@ def create_stored_interview_session(
             language=payload.language,
             max_questions=payload.max_questions,
             allow_external_ai=payload.allow_external_ai,
+            user_id=payload.user_id,
         )
     except ValueError as exc:
         db.rollback()
@@ -255,6 +256,7 @@ async def create_session_from_upload(
     language: str = Form(default="vi"),
     max_questions: int = Form(default=5),
     allow_external_ai: bool = Form(default=True),
+    user_id: int | None = Form(default=None),
     db: Session = Depends(get_db),
 ) -> InterviewSessionResponse:
     # 1. Resolve CV text from uploaded file or existing ID
@@ -299,6 +301,7 @@ async def create_session_from_upload(
             max_questions=max_questions,
             allow_external_ai=allow_external_ai,
             research_consent=False,
+            user_id=user_id,
             context_source="user_upload",
         )
     except (ValueError, SQLAlchemyError) as exc:
@@ -421,6 +424,15 @@ def create_synthetic_interview_session(
             detail=f"Failed to create synthetic interview session: {exc}",
         ) from exc
     return _session_response(session)
+
+
+@router.get("/users/{user_id}/sessions", response_model=list[InterviewSessionResponse])
+def list_user_sessions(
+    user_id: int,
+    db: Session = Depends(get_db),
+) -> list[InterviewSessionResponse]:
+    sessions = InterviewSessionService.list_for_user(db, user_id)
+    return [_session_response(s) for s in sessions]
 
 
 @router.get("/sessions/{session_id}", response_model=InterviewSessionResponse)

@@ -55,6 +55,7 @@ class StoredInterviewSessionCreateRequest(BaseModel):
     language: str = Field(default="vi", pattern="^(vi|en)$")
     max_questions: int = Field(default=8, ge=5, le=15)
     allow_external_ai: bool = True
+    user_id: int | None = Field(default=None)
 
 
 class StoredCvOption(BaseModel):
