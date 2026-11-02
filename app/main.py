@@ -18,12 +18,9 @@ app = FastAPI(title=settings.APP_NAME)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://localhost:8000",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:5174",
-        "http://127.0.0.1:8000",
+        origin.strip()
+        for origin in settings.CORS_ORIGINS.split(",")
+        if origin.strip()
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -34,6 +31,11 @@ app.include_router(api_router, prefix="/api/v1")
 
 DEMO_DIR = Path(__file__).resolve().parent / "static" / "interview_demo"
 app.mount("/demo-assets", StaticFiles(directory=DEMO_DIR), name="demo-assets")
+
+
+@app.get("/health", tags=["Health"])
+def health_check() -> dict[str, str]:
+    return {"status": "ok"}
 
 
 @app.get("/demo", include_in_schema=False)
