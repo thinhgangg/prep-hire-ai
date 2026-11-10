@@ -774,10 +774,12 @@ class InterviewSessionService:
                 turn.stage,
                 turn.criterion,
             )
+            is_refusal = scorer_version == "non_answer_fallback"
             turn.answer_scorer_version = scorer_version
             turn.answer_scores_json = {
                 "status": "success",
                 "scope": "turn_evidence_only",
+                "is_non_answer": is_refusal,
                 "scores": scores,
                 "applicable_criteria": applicable,
                 "applicable_scores": {

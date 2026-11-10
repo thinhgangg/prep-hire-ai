@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -9,6 +10,86 @@ from app.core.config import BASE_DIR, settings
 if TYPE_CHECKING:
     from app.services.question_ranking_v2_service import PairwiseQuestionRanker
     from app.services.weak_supervision_training_service import CandidateAnswerScorer
+
+
+NON_ANSWER_PATTERNS = [
+    r"^(?:dạ\s+|vâng\s+|à\s+|ừm\s+)?(?:tôi|em|mình)?\s*(?:không\s+biết|ko\s+biết|k\s+biết|chưa\s+biết|không\s+rõ|ko\s+rõ|k\s+rõ|chưa\s+rõ|chưa\s+học|chưa\s+tìm\s+hiểu|không\s+nắm\s+được|không\s+trả\s+lời\s+được|chưa\s+tiếp\s+cận|chưa\s+làm|chưa\s+từng\s+làm)(?:\s+(?:ạ|ạ\s*\.|nhiều|rõ|lắm|phần\s+này|câu\s+này|về\s+cái\s+này|về\s+phần\s+này))?[\.\s]*$",
+    r"^(?:dạ\s+|vâng\s+)?(?:xin\s+phép\s+|cho\s+em\s+)?(?:bỏ\s+qua|bo\s+qua|cho\s+qua|qua\s+câu\s+này|bỏ\s+qua\s+câu\s+này)(?:\s+(?:ạ|câu\s+này|ạ\s*\.))?[\.\s]*$",
+    r"^(?:dạ\s+)?(?:tôi|em)?\s*(?:chịu|chịu\s+thôi|chịu\s+ạ|không\s+có\s+câu\s+trả\s+lời)[\.\s]*$",
+    r"^(?:pass|skip|idk|no\s+idea|no\s+answer|next)[\.\s!]*$",
+    r"^[\.\s\?\-,\!_]+$",
+]
+
+REFUSAL_PHRASES = (
+    "không biết",
+    "ko biết",
+    "k biết",
+    "chưa biết",
+    "không rõ",
+    "ko rõ",
+    "k rõ",
+    "chưa rõ",
+    "chưa tìm hiểu",
+    "chưa học",
+    "chưa tiếp cận",
+    "chưa từng làm",
+    "chưa làm qua",
+    "chưa có kinh nghiệm về",
+    "không trả lời được",
+    "chưa trả lời được",
+    "không nắm được",
+    "không có câu trả lời",
+    "bỏ qua",
+    "bo qua",
+    "xin phép bỏ qua",
+    "cho qua",
+    "cho em qua",
+    "i don't know",
+    "i do not know",
+    "no idea",
+    "pass",
+    "skip",
+)
+
+
+def is_non_answer(text: str) -> bool:
+    """Xác định câu trả lời có phải là không biết, từ chối hoặc bỏ qua không."""
+    if not text:
+        return True
+    cleaned = text.strip().lower()
+    if len(cleaned) == 0:
+        return True
+
+    # 1. Toàn dấu câu hoặc quá ngắn (< 3 ký tự)
+    if re.match(r"^[\.\s\?\-,\!_]+$", cleaned) or len(cleaned) < 3:
+        return True
+
+    # 2. Khớp các mẫu câu từ chối cụ thể
+    for pat in NON_ANSWER_PATTERNS:
+        if re.search(pat, cleaned, re.IGNORECASE):
+            return True
+
+    # 3. Câu ngắn (dưới 18 từ) chứa cụm từ từ chối mà không có phần giải thích kỹ thuật
+    words = cleaned.split()
+    if len(words) <= 18:
+        has_refusal = any(p in cleaned for p in REFUSAL_PHRASES)
+        if has_refusal:
+            has_contrast = any(
+                c in cleaned
+                for c in [
+                    "nhưng",
+                    "tuy nhiên",
+                    "song",
+                    "theo em",
+                    "em nghĩ",
+                    "thực ra là",
+                    "thực tế là",
+                ]
+            )
+            if not has_contrast:
+                return True
+
+    return False
 
 
 class InterviewModelService:
@@ -106,6 +187,20 @@ class InterviewModelService:
         stage: str,
         target_criterion: str,
     ) -> tuple[dict[str, float], str]:
+        # Xử lý trường hợp không trả lời, bỏ qua hoặc câu trả lời không biết
+        if is_non_answer(answer):
+            criteria = (
+                "answer_relevance",
+                "technical_correctness",
+                "expected_signal_coverage",
+                "reasoning_quality",
+                "evidence_quality",
+                "clarity_conciseness",
+                "consistency",
+            )
+            # Điểm sàn tối thiểu 1.0/5.0 cho việc không cung cấp bằng chứng năng lực
+            return {criterion: 1.0 for criterion in criteria}, "non_answer_fallback"
+
         scorer = cls._get_answer_scorer()
         scores = scorer.score(
             context_text,

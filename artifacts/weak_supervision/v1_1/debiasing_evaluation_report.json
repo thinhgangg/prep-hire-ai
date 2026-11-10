@@ -1,0 +1,72 @@
+{
+  "criteria_comparison": {
+    "answer_relevance": {
+      "old_gap": 0.5951,
+      "new_gap": 0.3169,
+      "bias_reduction_percent": 46.8,
+      "old_mean_ai": 4.734,
+      "old_mean_human": 4.139,
+      "new_mean_ai": 4.779,
+      "new_mean_human": 4.462
+    },
+    "technical_correctness": {
+      "old_gap": 0.6318,
+      "new_gap": 0.2947,
+      "bias_reduction_percent": 53.4,
+      "old_mean_ai": 4.629,
+      "old_mean_human": 3.997,
+      "new_mean_ai": 4.624,
+      "new_mean_human": 4.329
+    },
+    "expected_signal_coverage": {
+      "old_gap": 0.4706,
+      "new_gap": 0.1958,
+      "bias_reduction_percent": 58.4,
+      "old_mean_ai": 4.604,
+      "old_mean_human": 4.133,
+      "new_mean_ai": 4.635,
+      "new_mean_human": 4.439
+    },
+    "reasoning_quality": {
+      "old_gap": 0.5278,
+      "new_gap": 0.2513,
+      "bias_reduction_percent": 52.4,
+      "old_mean_ai": 4.291,
+      "old_mean_human": 3.763,
+      "new_mean_ai": 4.359,
+      "new_mean_human": 4.107
+    },
+    "evidence_quality": {
+      "old_gap": 0.4567,
+      "new_gap": 0.1805,
+      "bias_reduction_percent": 60.5,
+      "old_mean_ai": 4.216,
+      "old_mean_human": 3.759,
+      "new_mean_ai": 4.283,
+      "new_mean_human": 4.103
+    },
+    "clarity_conciseness": {
+      "old_gap": 0.2911,
+      "new_gap": 0.0827,
+      "bias_reduction_percent": 71.6,
+      "old_mean_ai": 4.798,
+      "old_mean_human": 4.507,
+      "new_mean_ai": 4.857,
+      "new_mean_human": 4.775
+    },
+    "consistency": {
+      "old_gap": 0.4509,
+      "new_gap": 0.2067,
+      "bias_reduction_percent": 54.2,
+      "old_mean_ai": 4.743,
+      "old_mean_human": 4.292,
+      "new_mean_ai": 4.815,
+      "new_mean_human": 4.608
+    }
+  },
+  "overall": {
+    "old_overall_gap": 0.4891,
+    "new_overall_gap": 0.2184,
+    "total_bias_reduction_percent": 55.4
+  }
+}

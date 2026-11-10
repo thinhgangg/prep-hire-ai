@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.models.interview_evidence_summary import InterviewEvidenceSummary
 from app.models.interview_session import InterviewSession
+from app.services.interview_model_service import is_non_answer
 
 
 AGGREGATOR_VERSION = "interview-evidence-v1"
@@ -85,7 +86,28 @@ class InterviewEvidenceAggregator:
     @staticmethod
     def _valid_scores(turn: Any) -> tuple[dict[str, float], set[str]] | None:
         payload = turn.answer_scores_json or {}
-        if turn.answer_text is None or payload.get("status") != "success":
+        ans = (turn.answer_text or "").strip()
+
+        # Trường hợp ứng viên không trả lời, bỏ qua hoặc câu trả lời không biết
+        if not ans or is_non_answer(ans) or payload.get("is_non_answer"):
+            criteria = (
+                "answer_relevance",
+                "technical_correctness",
+                "expected_signal_coverage",
+                "reasoning_quality",
+                "evidence_quality",
+                "clarity_conciseness",
+                "consistency",
+            )
+            scores = {c: 1.0 for c in criteria}
+            applicable = {
+                str(item) for item in payload.get("applicable_criteria") or []
+            }
+            if not applicable and getattr(turn, "criterion", None):
+                applicable = {str(turn.criterion)}
+            return scores, applicable or set(criteria)
+
+        if payload.get("status") != "success":
             return None
         raw_scores = payload.get("scores") or {}
         scores: dict[str, float] = {}
@@ -167,9 +189,9 @@ class InterviewEvidenceAggregator:
         if not evidence:
             return (
                 {
-                    "score": None,
+                    "score": 1.0,
                     "confidence": 0.0,
-                    "status": "insufficient_evidence",
+                    "status": "unanswered_penalty",
                     "evidence_count": 0,
                     "evidence_turns": [],
                     "strong_evidence_turns": [],
@@ -177,9 +199,9 @@ class InterviewEvidenceAggregator:
                 [],
                 [
                     {
-                        "type": "insufficient_evidence",
+                        "type": "unanswered_penalty",
                         "competency": competency,
-                        "message": f"No usable turn evidence for {competency}.",
+                        "message": f"Ứng viên không cung cấp bằng chứng cho {competency} (câu hỏi bị bỏ qua hoặc không trả lời).",
                     }
                 ],
             )
@@ -255,66 +277,108 @@ class InterviewEvidenceAggregator:
 
     @classmethod
     def aggregate(cls, session: InterviewSession) -> dict[str, Any]:
-        answered_turns = [turn for turn in session.turns if turn.answer_text is not None]
+        total_expected = max(session.max_questions or 5, len(session.turns))
+        all_turns = list(session.turns)
+
+        # Phân loại chi tiết các câu trả lời
+        unanswered_turns = []
+        non_answer_turns = []
+        valid_answered_turns = []
+
+        for turn in all_turns:
+            ans = (turn.answer_text or "").strip()
+            if not ans:
+                unanswered_turns.append(turn.turn_index)
+            elif is_non_answer(ans) or (turn.answer_scores_json or {}).get("is_non_answer"):
+                non_answer_turns.append(turn.turn_index)
+            else:
+                valid_answered_turns.append(turn.turn_index)
+
+        # Số lượt bị thiếu nếu phiên bị kết thúc sớm
+        missing_count = max(0, total_expected - len(all_turns))
+
         competencies: dict[str, dict[str, Any]] = {}
         evidence: dict[str, list[dict[str, Any]]] = {}
-        flags = cls._consistency_flags(answered_turns)
+        flags = cls._consistency_flags(all_turns)
+
         for competency in BASE_COMPETENCIES:
             result, competency_evidence, competency_flags = cls._aggregate_competency(
-                answered_turns,
+                all_turns,
                 competency,
             )
             competencies[competency] = result
             evidence[competency] = competency_evidence
             flags.extend(competency_flags)
 
-        available = {
-            name: result
-            for name, result in competencies.items()
-            if result["score"] is not None
-        }
-        if available:
-            available_weight = sum(OVERALL_WEIGHTS[name] for name in available)
-            overall_score = sum(
-                float(result["score"]) * OVERALL_WEIGHTS[name]
-                for name, result in available.items()
-            ) / available_weight
-            confidence = sum(
-                float(result["confidence"]) * OVERALL_WEIGHTS[name]
-                for name, result in available.items()
-            ) / available_weight
-            confidence *= len(available) / len(BASE_COMPETENCIES)
-            sufficient_components = sum(
-                result["status"] == "sufficient" for result in available.values()
+        # Tính điểm số tổng thể có trừ điểm câu hỏi không trả lời / không biết
+        total_weight = sum(OVERALL_WEIGHTS[c] for c in BASE_COMPETENCIES)
+        raw_overall = (
+            sum(
+                float(competencies[c]["score"]) * OVERALL_WEIGHTS[c]
+                for c in BASE_COMPETENCIES
             )
-            overall_status = (
-                "sufficient"
-                if (
-                    len(available) >= 5
-                    and sufficient_components >= 4
-                    and confidence >= 0.6
-                )
-                else "limited"
-            )
-            overall = {
-                "score": round(overall_score, 3),
-                "confidence": round(confidence, 3),
-                "status": overall_status,
-                "covered_competencies": sorted(available),
-                "sufficient_competency_count": sufficient_components,
-                "missing_competencies": sorted(
-                    set(BASE_COMPETENCIES).difference(available)
+            / total_weight
+        )
+
+        # Tỷ lệ hoàn thành câu hỏi thực chất (không tính câu bỏ qua/không biết)
+        completion_rate = len(valid_answered_turns) / max(1, total_expected)
+
+        # Phạt điểm trực tiếp vào điểm tổng kết nếu có câu không trả lời hoặc không biết
+        # Mỗi câu không hoàn thành sẽ kéo tụt điểm trung bình theo đúng trọng số
+        overall_score = raw_overall
+
+        # Độ tin cậy tính trên cơ sở tỷ lệ câu hỏi thực chất
+        base_conf = sum(
+            float(competencies[c]["confidence"]) * OVERALL_WEIGHTS[c]
+            for c in BASE_COMPETENCIES
+        ) / total_weight
+        confidence = round(base_conf * completion_rate, 3)
+
+        total_penalized_turns = len(unanswered_turns) + len(non_answer_turns) + missing_count
+        if total_penalized_turns > 0:
+            penalty_details = []
+            if non_answer_turns:
+                penalty_details.append(f"{len(non_answer_turns)} câu trả lời không biết/bỏ qua")
+            if unanswered_turns:
+                penalty_details.append(f"{len(unanswered_turns)} câu chưa trả lời")
+            if missing_count > 0:
+                penalty_details.append(f"{missing_count} câu bị bỏ dở do kết thúc sớm")
+
+            flags.append({
+                "type": "unanswered_penalty",
+                "message": (
+                    f"Điểm số tổng cuối cùng đã bị trừ do: {'; '.join(penalty_details)}. "
+                    f"Tỷ lệ hoàn thành thực chất: {completion_rate*100:.1f}%."
                 ),
-            }
-        else:
-            overall = {
-                "score": None,
-                "confidence": 0.0,
-                "status": "insufficient_evidence",
-                "covered_competencies": [],
-                "missing_competencies": list(BASE_COMPETENCIES),
-            }
+                "unanswered_count": len(unanswered_turns) + missing_count,
+                "non_answer_count": len(non_answer_turns),
+                "valid_count": len(valid_answered_turns),
+                "total_expected": total_expected,
+                "completion_rate": round(completion_rate, 3),
+            })
+
+        overall_status = (
+            "sufficient"
+            if (completion_rate >= 0.8 and confidence >= 0.5)
+            else "limited" if completion_rate >= 0.4 else "unanswered_penalty"
+        )
+
+        overall = {
+            "score": round(overall_score, 3),
+            "confidence": confidence,
+            "status": overall_status,
+            "total_expected_questions": total_expected,
+            "valid_answered_count": len(valid_answered_turns),
+            "non_answer_count": len(non_answer_turns),
+            "unanswered_count": len(unanswered_turns) + missing_count,
+            "completion_rate": round(completion_rate, 3),
+            "covered_competencies": list(BASE_COMPETENCIES),
+            "missing_competencies": [
+                c for c in BASE_COMPETENCIES if competencies[c]["status"] == "unanswered_penalty"
+            ],
+        }
         competencies["overall_readiness"] = overall
+
         return {
             "aggregator_version": AGGREGATOR_VERSION,
             "status": "final" if session.status == "completed" else "provisional",
