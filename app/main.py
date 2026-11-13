@@ -1,10 +1,14 @@
-﻿
+
 from dotenv import load_dotenv
 import os
 from pathlib import Path
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
+
+# Đồng bộ API key chuẩn cho Google GenAI SDK
+if os.environ.get("GEMINI_API_KEY"):
+    os.environ["GOOGLE_API_KEY"] = os.environ["GEMINI_API_KEY"]
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

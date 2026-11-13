@@ -323,45 +323,77 @@ class InterviewEvidenceAggregator:
         # Tỷ lệ hoàn thành câu hỏi thực chất (không tính câu bỏ qua/không biết)
         completion_rate = len(valid_answered_turns) / max(1, total_expected)
 
-        # Phạt điểm trực tiếp vào điểm tổng kết nếu có câu không trả lời hoặc không biết
-        # Mỗi câu không hoàn thành sẽ kéo tụt điểm trung bình theo đúng trọng số
-        overall_score = raw_overall
-
-        # Độ tin cậy tính trên cơ sở tỷ lệ câu hỏi thực chất
-        base_conf = sum(
-            float(competencies[c]["confidence"]) * OVERALL_WEIGHTS[c]
-            for c in BASE_COMPETENCIES
-        ) / total_weight
-        confidence = round(base_conf * completion_rate, 3)
-
-        total_penalized_turns = len(unanswered_turns) + len(non_answer_turns) + missing_count
-        if total_penalized_turns > 0:
-            penalty_details = []
-            if non_answer_turns:
-                penalty_details.append(f"{len(non_answer_turns)} câu trả lời không biết/bỏ qua")
-            if unanswered_turns:
-                penalty_details.append(f"{len(unanswered_turns)} câu chưa trả lời")
-            if missing_count > 0:
-                penalty_details.append(f"{missing_count} câu bị bỏ dở do kết thúc sớm")
-
+        # Nếu ứng viên KHÔNG trả lời bất kỳ câu hỏi nào (bỏ qua toàn bộ hoặc kết thúc luôn phiên): Cho 0 điểm
+        if len(valid_answered_turns) == 0:
+            overall_score = 0.0
+            confidence = 0.0
+            overall_status = "zero_score"
+            for c in BASE_COMPETENCIES:
+                competencies[c]["score"] = 0.0
+                competencies[c]["confidence"] = 0.0
+                competencies[c]["status"] = "zero_score"
+            
             flags.append({
-                "type": "unanswered_penalty",
+                "type": "zero_score_penalty",
                 "message": (
-                    f"Điểm số tổng cuối cùng đã bị trừ do: {'; '.join(penalty_details)}. "
-                    f"Tỷ lệ hoàn thành thực chất: {completion_rate*100:.1f}%."
+                    f"Ứng viên bỏ qua hoặc không trả lời bất kỳ câu hỏi nào (0/{total_expected} câu hoàn thành). "
+                    "Hệ thống tự động chấm 0 ĐIỂM toàn diện cho phiên phỏng vấn này."
                 ),
                 "unanswered_count": len(unanswered_turns) + missing_count,
                 "non_answer_count": len(non_answer_turns),
-                "valid_count": len(valid_answered_turns),
+                "valid_count": 0,
                 "total_expected": total_expected,
-                "completion_rate": round(completion_rate, 3),
+                "completion_rate": 0.0,
             })
+        else:
+            # Tính điểm số tổng thể có trừ điểm câu hỏi không trả lời / không biết
+            total_weight = sum(OVERALL_WEIGHTS[c] for c in BASE_COMPETENCIES)
+            raw_overall = (
+                sum(
+                    float(competencies[c]["score"]) * OVERALL_WEIGHTS[c]
+                    for c in BASE_COMPETENCIES
+                )
+                / total_weight
+            )
 
-        overall_status = (
-            "sufficient"
-            if (completion_rate >= 0.8 and confidence >= 0.5)
-            else "limited" if completion_rate >= 0.4 else "unanswered_penalty"
-        )
+            # Phạt trực tiếp theo tỷ lệ hoàn thành câu hỏi thực chất
+            overall_score = round(raw_overall * completion_rate, 3)
+
+            # Độ tin cậy tính trên cơ sở tỷ lệ câu hỏi thực chất
+            base_conf = sum(
+                float(competencies[c]["confidence"]) * OVERALL_WEIGHTS[c]
+                for c in BASE_COMPETENCIES
+            ) / total_weight
+            confidence = round(base_conf * completion_rate, 3)
+
+            overall_status = (
+                "sufficient"
+                if (completion_rate >= 0.8 and confidence >= 0.5)
+                else "limited" if completion_rate >= 0.4 else "unanswered_penalty"
+            )
+
+            total_penalized_turns = len(unanswered_turns) + len(non_answer_turns) + missing_count
+            if total_penalized_turns > 0:
+                penalty_details = []
+                if non_answer_turns:
+                    penalty_details.append(f"{len(non_answer_turns)} câu trả lời không biết/bỏ qua")
+                if unanswered_turns:
+                    penalty_details.append(f"{len(unanswered_turns)} câu chưa trả lời")
+                if missing_count > 0:
+                    penalty_details.append(f"{missing_count} câu bị bỏ dở do kết thúc sớm")
+
+                flags.append({
+                    "type": "unanswered_penalty",
+                    "message": (
+                        f"Điểm số tổng cuối cùng đã bị trừ do: {'; '.join(penalty_details)}. "
+                        f"Tỷ lệ hoàn thành thực chất: {completion_rate*100:.1f}%."
+                    ),
+                    "unanswered_count": len(unanswered_turns) + missing_count,
+                    "non_answer_count": len(non_answer_turns),
+                    "valid_count": len(valid_answered_turns),
+                    "total_expected": total_expected,
+                    "completion_rate": round(completion_rate, 3),
+                })
 
         overall = {
             "score": round(overall_score, 3),
