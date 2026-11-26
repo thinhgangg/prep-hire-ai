@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer, selectinload
 
 from app.core.config import settings
 from app.models.interview_session import InterviewSession
@@ -803,6 +803,25 @@ class InterviewSessionService:
         )
 
     @staticmethod
+    def _extract_jd_meta(jd_text: str) -> tuple[str | None, str | None]:
+        title: str | None = None
+        company: str | None = None
+        for raw_line in (jd_text or "").splitlines()[:15]:
+            line = raw_line.strip()
+            if not line:
+                continue
+            lower = line.lower()
+            if not title and lower.startswith("job title:"):
+                val = line.split(":", 1)[1].strip()
+                if val:
+                    title = val
+            elif not company and lower.startswith("company:"):
+                val = line.split(":", 1)[1].strip()
+                if val:
+                    company = val
+        return title, company
+
+    @staticmethod
     def create(
         db: Session,
         cv_text: str,
@@ -815,6 +834,8 @@ class InterviewSessionService:
         context_source: str = "user_supplied",
         source_cv_id: int | None = None,
         source_job_id: int | None = None,
+        job_title: str | None = None,
+        job_company: str | None = None,
     ) -> InterviewSession:
         extraction_cv_text = AdaptiveQuestionEngine.redact_personal_data(cv_text) if allow_external_ai else cv_text
         extraction_jd_text = AdaptiveQuestionEngine.redact_personal_data(jd_text) if allow_external_ai else jd_text
@@ -828,6 +849,20 @@ class InterviewSessionService:
             extraction_jd_text,
             use_ai=False,
         )
+        job_profile_dict = job_profile.model_dump(mode="json")
+        parsed_title, parsed_company = InterviewSessionService._extract_jd_meta(jd_text)
+        resolved_title = (job_title or "").strip() or parsed_title
+        resolved_company = (job_company or "").strip() or parsed_company
+        if resolved_title and (
+            not job_profile_dict.get("title")
+            or job_profile_dict.get("title") == "Uploaded JD"
+        ):
+            job_profile_dict["title"] = resolved_title
+        if resolved_company and not job_profile_dict.get("company_name"):
+            job_profile_dict["company_name"] = resolved_company
+        if source_job_id and not job_profile_dict.get("job_id"):
+            job_profile_dict["job_id"] = source_job_id
+
         session = InterviewSession(
             session_id=str(uuid.uuid4()),
             user_id=user_id,
@@ -841,7 +876,7 @@ class InterviewSessionService:
             cv_text=cv_text.strip(),
             jd_text=jd_text.strip(),
             cv_profile_json=cv_profile.model_dump(mode="json"),
-            job_profile_json=job_profile.model_dump(mode="json"),
+            job_profile_json=job_profile_dict,
         )
         db.add(session)
         db.flush()
@@ -857,6 +892,13 @@ class InterviewSessionService:
     def list_for_user(db: Session, user_id: int, limit: int = 30) -> list[InterviewSession]:
         return (
             db.query(InterviewSession)
+            .options(
+                defer(InterviewSession.cv_text),
+                defer(InterviewSession.jd_text),
+                selectinload(InterviewSession.turns).defer(
+                    InterviewTurn.question_candidates_json
+                ),
+            )
             .filter(InterviewSession.user_id == user_id)
             .order_by(InterviewSession.created_at.desc())
             .limit(limit)
@@ -864,8 +906,28 @@ class InterviewSessionService:
         )
 
     @staticmethod
+    def list_all(db: Session, limit: int = 100) -> list[InterviewSession]:
+        return (
+            db.query(InterviewSession)
+            .options(
+                defer(InterviewSession.cv_text),
+                defer(InterviewSession.jd_text),
+                selectinload(InterviewSession.turns).defer(
+                    InterviewTurn.question_candidates_json
+                ),
+            )
+            .order_by(InterviewSession.created_at.desc())
+            .limit(max(1, min(limit, 200)))
+            .all()
+        )
+
+    @staticmethod
     def get(db: Session, session_id: str, lock: bool = False) -> InterviewSession | None:
-        query = db.query(InterviewSession).filter(InterviewSession.session_id == session_id)
+        query = (
+            db.query(InterviewSession)
+            .options(selectinload(InterviewSession.turns))
+            .filter(InterviewSession.session_id == session_id)
+        )
         return query.with_for_update().first() if lock else query.first()
 
     @staticmethod

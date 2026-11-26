@@ -142,6 +142,7 @@ class InterviewEvidenceSummaryResponse(BaseModel):
 
 class InterviewSessionResponse(BaseModel):
     session_id: str
+    user_id: int | None = None
     status: str
     language: str
     max_questions: int
@@ -151,6 +152,8 @@ class InterviewSessionResponse(BaseModel):
     context_source: str = "user_supplied"
     source_cv_id: int | None = None
     source_job_id: int | None = None
+    cv_profile_json: dict | None = None
+    job_profile_json: dict | None = None
     current_question: InterviewQuestionResponse | None = None
     turns: list[InterviewTurnResponse] = Field(default_factory=list)
     created_at: datetime

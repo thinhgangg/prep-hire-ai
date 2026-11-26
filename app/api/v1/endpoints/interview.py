@@ -43,58 +43,57 @@ from app.services.evaluation_service import CandidateEvaluationService, ExpertCo
 router = APIRouter()
 
 
-def _session_response(session) -> InterviewSessionResponse:
-    turns = [
-        InterviewTurnResponse(
-            turn_index=turn.turn_index,
-            stage=turn.stage,
-            question=turn.question_text,
-            answer=turn.answer_text,
-            question_source=turn.question_source,
-            provider_name=getattr(turn, "provider_name", None),
-            model_name=turn.model_name,
-            generation_latency_ms=turn.generation_latency_ms,
-            question_candidate_count=len(
-                [
-                    item
-                    for item in (getattr(turn, "question_candidates_json", None) or [])
-                    if item.get("question")
-                ]
-            ) or 1,
-            question_candidates=[
-                InterviewQuestionCandidateResponse(
-                    provider_name=item.get("provider"),
-                    model_name=item.get("model_name"),
-                    question=str(item.get("question") or ""),
-                    criterion=item.get("criterion"),
-                    question_type=item.get("question_type"),
-                    difficulty=item.get("difficulty"),
-                    pairwise_utility=item.get("pairwise_utility"),
-                    selected=bool(item.get("selected", False)),
-                    generation_latency_ms=int(
-                        item.get("generation_latency_ms") or 0
-                    ),
-                )
-                for item in (
-                    getattr(turn, "question_candidates_json", None) or []
-                )
-                if item.get("question")
-            ],
-            selected_question_score=getattr(turn, "selected_question_score", None),
-            question_ranker_version=getattr(turn, "question_ranker_version", None),
-            question_selection_latency_ms=getattr(
-                turn, "question_selection_latency_ms", 0
-            ),
-            answer_evidence=getattr(turn, "answer_scores_json", None),
-            answer_scorer_version=getattr(turn, "answer_scorer_version", None),
-            answer_scoring_latency_ms=getattr(
-                turn, "answer_scoring_latency_ms", 0
-            ),
-            created_at=turn.created_at,
-            answered_at=turn.answered_at,
+def _session_response(session, *, include_candidates: bool = True) -> InterviewSessionResponse:
+    turns = []
+    for turn in session.turns:
+        raw_candidates = (
+            (getattr(turn, "question_candidates_json", None) or [])
+            if include_candidates
+            else []
         )
-        for turn in session.turns
-    ]
+        candidate_items = [
+            InterviewQuestionCandidateResponse(
+                provider_name=item.get("provider"),
+                model_name=item.get("model_name"),
+                question=str(item.get("question") or ""),
+                criterion=item.get("criterion"),
+                question_type=item.get("question_type"),
+                difficulty=item.get("difficulty"),
+                pairwise_utility=item.get("pairwise_utility"),
+                selected=bool(item.get("selected", False)),
+                generation_latency_ms=int(
+                    item.get("generation_latency_ms") or 0
+                ),
+            )
+            for item in raw_candidates
+            if item.get("question")
+        ]
+        turns.append(
+            InterviewTurnResponse(
+                turn_index=turn.turn_index,
+                stage=turn.stage,
+                question=turn.question_text,
+                answer=turn.answer_text,
+                question_source=turn.question_source,
+                provider_name=getattr(turn, "provider_name", None),
+                model_name=turn.model_name,
+                generation_latency_ms=turn.generation_latency_ms,
+                question_candidate_count=len(candidate_items) or 1,
+                question_candidates=candidate_items,
+                selected_question_score=getattr(turn, "selected_question_score", None),
+                question_ranker_version=getattr(turn, "question_ranker_version", None),
+                question_selection_latency_ms=getattr(
+                    turn, "question_selection_latency_ms", 0
+                ),
+                answer_evidence=getattr(turn, "answer_scores_json", None),
+                answer_scorer_version=getattr(turn, "answer_scorer_version", None),
+                answer_scoring_latency_ms=getattr(
+                    turn, "answer_scoring_latency_ms", 0
+                ),
+                created_at=turn.created_at,
+                answered_at=turn.answered_at,
+            )
+        )
     active_turn = next(
         (turn for turn in turns if turn.turn_index == session.current_turn_index and turn.answer is None),
         None,
@@ -108,6 +107,7 @@ def _session_response(session) -> InterviewSessionResponse:
         )
     return InterviewSessionResponse(
         session_id=session.session_id,
+        user_id=getattr(session, "user_id", None),
         status=session.status,
         language=session.language,
         max_questions=session.max_questions,
@@ -117,6 +117,8 @@ def _session_response(session) -> InterviewSessionResponse:
         context_source=getattr(session, "context_source", "user_supplied"),
         source_cv_id=getattr(session, "source_cv_id", None),
         source_job_id=getattr(session, "source_job_id", None),
+        cv_profile_json=getattr(session, "cv_profile_json", None),
+        job_profile_json=getattr(session, "job_profile_json", None),
         current_question=current_question,
         turns=turns,
         created_at=session.created_at,
@@ -253,6 +255,8 @@ async def create_session_from_upload(
     job_id: int | None = Form(default=None),
     jd_file: UploadFile | None = File(default=None),
     jd_text: str | None = Form(default=None),
+    job_title: str | None = Form(default=None),
+    job_company: str | None = Form(default=None),
     language: str = Form(default="vi"),
     max_questions: int = Form(default=5),
     allow_external_ai: bool = Form(default=True),
@@ -277,6 +281,8 @@ async def create_session_from_upload(
 
     # 2. Resolve JD text from uploaded file, custom text, or existing job_id
     final_jd_text = ""
+    resolved_job_title = (job_title or "").strip() or None
+    resolved_job_company = (job_company or "").strip() or None
     if jd_file and jd_file.filename:
         jd_bytes = await jd_file.read()
         final_jd_text = CvIngestService.extract_text_from_file(jd_file.filename, jd_file.content_type, jd_bytes)
@@ -287,6 +293,9 @@ async def create_session_from_upload(
         job_row = db.query(Job).filter(Job.job_id == job_id).first()
         if job_row:
             final_jd_text = StoredInterviewDemoService.build_job_text(job_row)
+            resolved_job_title = job_row.title
+            if job_row.company:
+                resolved_job_company = job_row.company.name
 
     if not final_jd_text or len(final_jd_text) < 30:
         raise HTTPException(status_code=400, detail="Vui lòng chọn vị trí tuyển dụng hoặc nhập/tải lên mô tả công việc (JD)")
@@ -302,7 +311,11 @@ async def create_session_from_upload(
             allow_external_ai=allow_external_ai,
             research_consent=False,
             user_id=user_id,
-            context_source="user_upload",
+            context_source="stored_job" if job_id else "user_upload",
+            source_cv_id=cv_id,
+            source_job_id=job_id,
+            job_title=resolved_job_title,
+            job_company=resolved_job_company,
         )
     except (ValueError, SQLAlchemyError) as exc:
         db.rollback()
@@ -426,13 +439,22 @@ def create_synthetic_interview_session(
     return _session_response(session)
 
 
+@router.get("/sessions", response_model=list[InterviewSessionResponse])
+def list_all_sessions(
+    limit: int = 100,
+    db: Session = Depends(get_db),
+) -> list[InterviewSessionResponse]:
+    sessions = InterviewSessionService.list_all(db, limit=limit)
+    return [_session_response(s, include_candidates=False) for s in sessions]
+
+
 @router.get("/users/{user_id}/sessions", response_model=list[InterviewSessionResponse])
 def list_user_sessions(
     user_id: int,
     db: Session = Depends(get_db),
 ) -> list[InterviewSessionResponse]:
     sessions = InterviewSessionService.list_for_user(db, user_id)
-    return [_session_response(s) for s in sessions]
+    return [_session_response(s, include_candidates=False) for s in sessions]
 
 
 @router.get("/sessions/{session_id}", response_model=InterviewSessionResponse)

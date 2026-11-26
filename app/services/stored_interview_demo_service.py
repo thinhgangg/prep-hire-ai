@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import time
 from urllib.parse import urlparse
 
 import requests
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
+from app.models.company import Company
 from app.models.cv import CV
 from app.models.cv_analysis_result import CvAnalysisResult
 from app.models.job import Job
@@ -15,6 +17,8 @@ from app.services.pdf_processor import CvIngestService
 
 
 MAX_CV_BYTES = 5 * 1024 * 1024
+OPTIONS_CACHE_TTL_SECONDS = 60.0
+_options_cache: dict[int, tuple[float, dict]] = {}
 ALLOWED_CV_HOST_SUFFIXES = (
     ".cloudflarestorage.com",
     ".r2.dev",
@@ -122,24 +126,34 @@ class StoredInterviewDemoService:
     @staticmethod
     def list_options(db: Session, limit: int = 100) -> dict:
         normalized_limit = max(1, min(limit, 100))
+        now = time.monotonic()
+        cached = _options_cache.get(normalized_limit)
+        if cached and (now - cached[0]) < OPTIONS_CACHE_TTL_SECONDS:
+            return cached[1]
+
         analyses = {
             str(name).strip().casefold()
             for (name,) in db.query(CvAnalysisResult.cv_filename).distinct().all()
             if name
         }
-        cv_rows = db.query(CV).order_by(desc(CV.uploaded_at)).limit(300).all()
+        cv_rows = (
+            db.query(CV.cv_id, CV.file_name, CV.uploaded_at)
+            .order_by(desc(CV.uploaded_at))
+            .limit(300)
+            .all()
+        )
         cvs: list[dict] = []
         seen_names: set[str] = set()
-        for cv in cv_rows:
-            key = (cv.file_name or "").strip().casefold()
+        for cv_id, file_name, uploaded_at in cv_rows:
+            key = (file_name or "").strip().casefold()
             if not key or key in seen_names:
                 continue
             seen_names.add(key)
             cvs.append(
                 {
-                    "cv_id": cv.cv_id,
-                    "file_name": cv.file_name,
-                    "uploaded_at": cv.uploaded_at,
+                    "cv_id": cv_id,
+                    "file_name": file_name,
+                    "uploaded_at": uploaded_at,
                     "fallback_ready": key in analyses,
                 }
             )
@@ -147,22 +161,31 @@ class StoredInterviewDemoService:
                 break
 
         job_rows = (
-            db.query(Job)
+            db.query(
+                Job.job_id,
+                Job.title,
+                Company.name.label("company_name"),
+                Job.location,
+                Job.level,
+            )
+            .outerjoin(Company, Job.company_company_id == Company.company_id)
             .order_by(desc(Job.scraped_at), desc(Job.job_id))
             .limit(normalized_limit)
             .all()
         )
         jobs = [
             {
-                "job_id": job.job_id,
-                "title": job.title,
-                "company_name": job.company.name if job.company else None,
-                "location": job.location,
-                "level": job.level.value if job.level else None,
+                "job_id": job_id,
+                "title": title,
+                "company_name": company_name,
+                "location": location,
+                "level": level.value if level else None,
             }
-            for job in job_rows
+            for job_id, title, company_name, location, level in job_rows
         ]
-        return {"cvs": cvs, "jobs": jobs}
+        result = {"cvs": cvs, "jobs": jobs}
+        _options_cache[normalized_limit] = (now, result)
+        return result
 
     @classmethod
     def create_session(
