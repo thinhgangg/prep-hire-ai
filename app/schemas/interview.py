@@ -140,8 +140,66 @@ class InterviewEvidenceSummaryResponse(BaseModel):
     updated_at: datetime
 
 
+class InterviewGazeEventPayload(BaseModel):
+    timestamp: str
+    direction: str
+    duration: float = 0.0
+    behavior: str | None = None
+    penalty: float | None = None
+    snapshot: str | None = None
+    question_index: int | None = None
+    question_text: str | None = None
+
+
+class InterviewGazeReportRequest(BaseModel):
+    total_frames: int = Field(default=0, ge=0)
+    face_frames: int = Field(default=0, ge=0)
+    duration_sec: float = Field(default=0.0, ge=0.0)
+    camera_active: bool = False
+    face_presence_pct: float | None = Field(default=None, ge=0.0, le=100.0)
+    gaze_center_pct: float | None = Field(default=None, ge=0.0, le=100.0)
+    gaze_left_pct: float | None = Field(default=None, ge=0.0, le=100.0)
+    gaze_right_pct: float | None = Field(default=None, ge=0.0, le=100.0)
+    gaze_away_pct: float | None = Field(default=None, ge=0.0, le=100.0)
+    gaze_events: list[InterviewGazeEventPayload] = Field(default_factory=list)
+    gaze_timeline: list[dict] = Field(default_factory=list)
+    integrity_score: float | None = Field(default=None, ge=0.0, le=100.0)
+    integrity_rank: str | None = Field(default=None, pattern="^(HIGH|MEDIUM|LOW)$")
+    integrity_summary: dict | None = None
+
+
+class InterviewGazeReportResponse(InterviewGazeReportRequest):
+    report_id: int
+    session_id: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class InterviewReviewRequest(BaseModel):
+    shortlisted: bool | None = None
+    decision: str | None = Field(
+        default=None,
+        pattern="^(pending|shortlisted|interview_next|hired|rejected)$",
+    )
+    hr_notes: str | None = Field(default=None, max_length=5000)
+
+
+class InterviewReviewResponse(BaseModel):
+    review_id: int | None = None
+    session_id: str
+    shortlisted: bool = False
+    decision: str = "pending"
+    hr_notes: str | None = None
+    reviewed_by_user_id: int | None = None
+    reviewed_by_email: str | None = None
+    updated_at: datetime | None = None
+
+
 class InterviewSessionResponse(BaseModel):
     session_id: str
+    user_id: int | None = None
+    candidate_name: str | None = None
+    candidate_email: str | None = None
     status: str
     language: str
     max_questions: int
@@ -151,8 +209,11 @@ class InterviewSessionResponse(BaseModel):
     context_source: str = "user_supplied"
     source_cv_id: int | None = None
     source_job_id: int | None = None
+    cv_profile_json: dict | None = None
+    job_profile_json: dict | None = None
     current_question: InterviewQuestionResponse | None = None
     turns: list[InterviewTurnResponse] = Field(default_factory=list)
+    review: InterviewReviewResponse | None = None
     created_at: datetime
     completed_at: datetime | None = None
 

@@ -66,3 +66,15 @@ class InterviewSession(Base):
         "QuestionBenchmarkCase",
         passive_deletes=True,
     )
+    gaze_report = relationship(
+        "InterviewGazeReport",
+        back_populates="session",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+    review = relationship(
+        "InterviewReview",
+        back_populates="session",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
