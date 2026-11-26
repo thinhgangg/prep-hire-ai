@@ -18,10 +18,13 @@ class TtsPrewarmService:
 
         def notify() -> None:
             payload = json.dumps({"text": normalized}, ensure_ascii=False).encode("utf-8")
+            headers = {"Content-Type": "application/json; charset=utf-8"}
+            if settings.INTERNAL_SERVICE_SECRET:
+                headers["X-Internal-Service-Key"] = settings.INTERNAL_SERVICE_SECRET
             request = urllib.request.Request(
                 settings.TTS_PREWARM_URL,
                 data=payload,
-                headers={"Content-Type": "application/json; charset=utf-8"},
+                headers=headers,
                 method="POST",
             )
             try:

@@ -9,6 +9,8 @@ from app.models.job_skill import JobSkill
 from app.models.interview_session import InterviewSession
 from app.models.interview_turn import InterviewTurn
 from app.models.interview_evidence_summary import InterviewEvidenceSummary
+from app.models.interview_gaze_report import InterviewGazeReport
+from app.models.interview_review import InterviewReview
 from app.models.expert_annotation import ExpertAnnotation
 from app.models.question_benchmark import (
     QuestionBenchmarkCase,
@@ -41,6 +43,8 @@ __all__ = [
 	"InterviewSession",
 	"InterviewTurn",
 	"InterviewEvidenceSummary",
+	"InterviewGazeReport",
+	"InterviewReview",
 	"ExpertAnnotation",
 	"QuestionBenchmarkCase",
 	"QuestionBenchmarkOutput",

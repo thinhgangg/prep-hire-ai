@@ -1,10 +1,25 @@
 import time
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.core.auth import (
+    RequestActor,
+    assert_session_access,
+    get_request_actor,
+    require_staff,
+)
 from app.db.session import engine, get_db
+from app.models.candidate_evaluation import CandidateEvaluation
+from app.models.expert_annotation import ExpertAnnotation
+from app.models.interview_evidence_summary import InterviewEvidenceSummary
+from app.models.interview_gaze_report import InterviewGazeReport
+from app.models.interview_review import InterviewReview
+from app.models.interview_session import InterviewSession
+from app.models.interview_turn import InterviewTurn
+from app.models.user_data import User
 from app.schemas.interview import (
     ContextExtractionMetadata,
     CandidateEvaluationRequest,
@@ -16,34 +31,127 @@ from app.schemas.interview import (
     InterviewAnswerRequest,
     InterviewContextRequest,
     InterviewContextResponse,
+    InterviewEvidenceSummaryResponse,
+    InterviewGazeEventPayload,
+    InterviewGazeReportRequest,
+    InterviewGazeReportResponse,
     InterviewQuestionCandidateResponse,
     InterviewQuestionResponse,
+    InterviewReviewRequest,
+    InterviewReviewResponse,
     InterviewSessionCreateRequest,
     InterviewSessionResponse,
     InterviewTurnResponse,
-    InterviewEvidenceSummaryResponse,
     RealtimeInterviewModelStatusResponse,
-    SyntheticInterviewSessionCreateRequest,
     StoredInterviewOptionsResponse,
     StoredInterviewSessionCreateRequest,
+    SyntheticInterviewSessionCreateRequest,
 )
 from app.research.rubrics import CANDIDATE_EVALUATION_RUBRIC, QUESTION_QUALITY_RUBRIC
-from app.services.pdf_processor import CvIngestService
-from app.services.interview_service import InterviewSessionService
-from app.services.interview_service import AdaptiveQuestionEngine
-from app.services.interview_model_service import InterviewModelService
-from app.services.synthetic_interview_context_service import SyntheticInterviewContextService
+from app.services.evaluation_service import CandidateEvaluationService, ExpertConsensusService
 from app.services.interview_evidence_aggregation_service import (
     InterviewEvidenceSummaryService,
 )
+from app.services.interview_model_service import InterviewModelService
+from app.services.interview_service import AdaptiveQuestionEngine, InterviewSessionService
+from app.services.pdf_processor import CvIngestService
 from app.services.stored_interview_demo_service import StoredInterviewDemoService
-from app.services.evaluation_service import CandidateEvaluationService, ExpertConsensusService
+from app.services.synthetic_interview_context_service import SyntheticInterviewContextService
 
 
 router = APIRouter()
 
+_MAX_GAZE_SNAPSHOT_EVENTS = 12
+_MAX_SNAPSHOT_DATA_LEN = 350_000
 
-def _session_response(session, *, include_candidates: bool = True) -> InterviewSessionResponse:
+
+def _ensure_gaze_and_review_tables(db: Session) -> None:
+    try:
+        bind = db.get_bind()
+        if bind is not None:
+            InterviewGazeReport.__table__.create(bind=bind, checkfirst=True)
+            InterviewReview.__table__.create(bind=bind, checkfirst=True)
+    except Exception:
+        pass
+
+
+def _load_reviews_map(db: Session, session_ids: list[str]) -> dict[str, InterviewReview]:
+    if not session_ids:
+        return {}
+    try:
+        rows = (
+            db.query(InterviewReview)
+            .filter(InterviewReview.session_id.in_(session_ids))
+            .all()
+        )
+        return {row.session_id: row for row in rows}
+    except SQLAlchemyError:
+        db.rollback()
+        return {}
+
+
+def _load_users_map(db: Session, user_ids: list[int | None]) -> dict[int, User]:
+    clean_ids = sorted({uid for uid in user_ids if isinstance(uid, int) and uid > 0})
+    if not clean_ids:
+        return {}
+    try:
+        rows = db.query(User).filter(User.user_id.in_(clean_ids)).all()
+        return {row.user_id: row for row in rows}
+    except SQLAlchemyError:
+        db.rollback()
+        return {}
+
+
+def _review_response(review, session_id: str) -> InterviewReviewResponse | None:
+    if not review:
+        return None
+    return InterviewReviewResponse(
+        review_id=getattr(review, "review_id", None),
+        session_id=session_id,
+        shortlisted=bool(getattr(review, "shortlisted", False)),
+        decision=str(getattr(review, "decision", "pending") or "pending"),
+        hr_notes=getattr(review, "hr_notes", None),
+        reviewed_by_user_id=getattr(review, "reviewed_by_user_id", None),
+        reviewed_by_email=getattr(review, "reviewed_by_email", None),
+        updated_at=getattr(review, "updated_at", None),
+    )
+
+
+def _gaze_response(report: InterviewGazeReport) -> InterviewGazeReportResponse:
+    events = [
+        InterviewGazeEventPayload(**item)
+        for item in (report.gaze_events_json or [])
+        if isinstance(item, dict) and item.get("timestamp")
+    ]
+    return InterviewGazeReportResponse(
+        report_id=report.report_id,
+        session_id=report.session_id,
+        total_frames=report.total_frames,
+        face_frames=report.face_frames,
+        duration_sec=report.duration_sec,
+        camera_active=bool(report.camera_active),
+        face_presence_pct=report.face_presence_pct,
+        gaze_center_pct=report.gaze_center_pct,
+        gaze_left_pct=report.gaze_left_pct,
+        gaze_right_pct=report.gaze_right_pct,
+        gaze_away_pct=report.gaze_away_pct,
+        gaze_events=events,
+        gaze_timeline=list(report.gaze_timeline_json or []),
+        integrity_score=getattr(report, "integrity_score", None),
+        integrity_rank=getattr(report, "integrity_rank", None),
+        integrity_summary=getattr(report, "integrity_summary_json", None),
+        created_at=report.created_at,
+        updated_at=report.updated_at,
+    )
+
+
+def _session_response(
+    session,
+    *,
+    include_candidates: bool = True,
+    review=None,
+    user=None,
+) -> InterviewSessionResponse:
     turns = []
     for turn in session.turns:
         raw_candidates = (
@@ -108,6 +216,8 @@ def _session_response(session, *, include_candidates: bool = True) -> InterviewS
     return InterviewSessionResponse(
         session_id=session.session_id,
         user_id=getattr(session, "user_id", None),
+        candidate_name=getattr(user, "name", None) if user else None,
+        candidate_email=getattr(user, "email", None) if user else None,
         status=session.status,
         language=session.language,
         max_questions=session.max_questions,
@@ -121,6 +231,7 @@ def _session_response(session, *, include_candidates: bool = True) -> InterviewS
         job_profile_json=getattr(session, "job_profile_json", None),
         current_question=current_question,
         turns=turns,
+        review=_review_response(review, session.session_id),
         created_at=session.created_at,
         completed_at=session.completed_at,
     )
@@ -168,6 +279,12 @@ def _annotation_response(annotation) -> ExpertAnnotationResponse:
     )
 
 
+def _resolve_bound_user_id(actor: RequestActor, requested_user_id: int | None) -> int | None:
+    if not actor.is_staff and actor.user_id is not None:
+        return actor.user_id
+    return requested_user_id if requested_user_id is not None else actor.user_id
+
+
 @router.get("/rubrics")
 def get_research_rubrics() -> dict:
     return {
@@ -183,65 +300,6 @@ def get_research_rubrics() -> dict:
 def get_realtime_model_status() -> RealtimeInterviewModelStatusResponse:
     return RealtimeInterviewModelStatusResponse(**InterviewModelService.status())
 
-
-@router.get("/demo/options", response_model=StoredInterviewOptionsResponse)
-def get_stored_interview_options(
-    db: Session = Depends(get_db),
-) -> StoredInterviewOptionsResponse:
-    last_error: SQLAlchemyError | None = None
-    for attempt in range(3):
-        try:
-            return StoredInterviewOptionsResponse(
-                **StoredInterviewDemoService.list_options(db)
-            )
-        except OperationalError as exc:
-            last_error = exc
-            db.rollback()
-            engine.dispose()
-            if attempt < 2:
-                time.sleep(0.75 * (attempt + 1))
-        except SQLAlchemyError as exc:
-            db.rollback()
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to load stored interview options: {exc}",
-            ) from exc
-    raise HTTPException(
-        status_code=503,
-        detail="Supabase is temporarily unreachable. Please retry in a few seconds.",
-    ) from last_error
-
-
-@router.post(
-    "/demo/sessions",
-    response_model=InterviewSessionResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-def create_stored_interview_session(
-    payload: StoredInterviewSessionCreateRequest,
-    db: Session = Depends(get_db),
-) -> InterviewSessionResponse:
-    try:
-        session = StoredInterviewDemoService.create_session(
-            db,
-            cv_id=payload.cv_id,
-            job_id=payload.job_id,
-            language=payload.language,
-            max_questions=payload.max_questions,
-            allow_external_ai=payload.allow_external_ai,
-            user_id=payload.user_id,
-        )
-    except ValueError as exc:
-        db.rollback()
-        status_code = 404 if "not found" in str(exc).lower() else 400
-        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
-    except SQLAlchemyError as exc:
-        db.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to create stored interview session: {exc}",
-        ) from exc
-    return _session_response(session)
 
 @router.post(
     "/sessions/upload",
@@ -261,35 +319,45 @@ async def create_session_from_upload(
     max_questions: int = Form(default=5),
     allow_external_ai: bool = Form(default=True),
     user_id: int | None = Form(default=None),
+    actor: RequestActor = Depends(get_request_actor),
     db: Session = Depends(get_db),
 ) -> InterviewSessionResponse:
-    # 1. Resolve CV text from uploaded file or existing ID
+    bound_uid = _resolve_bound_user_id(actor, user_id)
+
     final_cv_text = ""
     if cv_file and cv_file.filename:
         cv_bytes = await cv_file.read()
-        final_cv_text = CvIngestService.extract_text_from_file(cv_file.filename, cv_file.content_type, cv_bytes)
+        final_cv_text = CvIngestService.extract_text_from_file(
+            cv_file.filename, cv_file.content_type, cv_bytes
+        )
     elif cv_text and len(cv_text.strip()) >= 30:
         final_cv_text = cv_text.strip()
     elif cv_id:
         from app.models.cv import CV
+
         cv_row = db.query(CV).filter(CV.cv_id == cv_id).first()
         if cv_row:
             final_cv_text, _ = StoredInterviewDemoService.load_cv_text(db, cv_row)
 
     if not final_cv_text or len(final_cv_text) < 30:
-        raise HTTPException(status_code=400, detail="Vui lòng tải lên file CV (PDF/DOCX/TXT) hoặc chọn một CV hợp lệ")
+        raise HTTPException(
+            status_code=400,
+            detail="Vui lòng tải lên file CV (PDF/DOCX/TXT) hoặc chọn một CV hợp lệ",
+        )
 
-    # 2. Resolve JD text from uploaded file, custom text, or existing job_id
     final_jd_text = ""
     resolved_job_title = (job_title or "").strip() or None
     resolved_job_company = (job_company or "").strip() or None
     if jd_file and jd_file.filename:
         jd_bytes = await jd_file.read()
-        final_jd_text = CvIngestService.extract_text_from_file(jd_file.filename, jd_file.content_type, jd_bytes)
+        final_jd_text = CvIngestService.extract_text_from_file(
+            jd_file.filename, jd_file.content_type, jd_bytes
+        )
     elif jd_text and len(jd_text.strip()) >= 30:
         final_jd_text = jd_text.strip()
     elif job_id:
         from app.models.job import Job
+
         job_row = db.query(Job).filter(Job.job_id == job_id).first()
         if job_row:
             final_jd_text = StoredInterviewDemoService.build_job_text(job_row)
@@ -298,9 +366,11 @@ async def create_session_from_upload(
                 resolved_job_company = job_row.company.name
 
     if not final_jd_text or len(final_jd_text) < 30:
-        raise HTTPException(status_code=400, detail="Vui lòng chọn vị trí tuyển dụng hoặc nhập/tải lên mô tả công việc (JD)")
+        raise HTTPException(
+            status_code=400,
+            detail="Vui lòng chọn vị trí tuyển dụng hoặc nhập/tải lên mô tả công việc (JD)",
+        )
 
-    # 3. Create interview session using custom CV and JD text
     try:
         session = InterviewSessionService.create(
             db=db,
@@ -310,7 +380,7 @@ async def create_session_from_upload(
             max_questions=max_questions,
             allow_external_ai=allow_external_ai,
             research_consent=False,
-            user_id=user_id,
+            user_id=bound_uid,
             context_source="stored_job" if job_id else "user_upload",
             source_cv_id=cv_id,
             source_job_id=job_id,
@@ -319,10 +389,11 @@ async def create_session_from_upload(
         )
     except (ValueError, SQLAlchemyError) as exc:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Lỗi khởi tạo phiên phỏng vấn: {exc}") from exc
+        raise HTTPException(
+            status_code=500, detail=f"Lỗi khởi tạo phiên phỏng vấn: {exc}"
+        ) from exc
 
     return _session_response(session)
-
 
 
 @router.post(
@@ -332,8 +403,10 @@ async def create_session_from_upload(
 )
 def create_interview_session(
     payload: InterviewSessionCreateRequest,
+    actor: RequestActor = Depends(get_request_actor),
     db: Session = Depends(get_db),
 ) -> InterviewSessionResponse:
+    bound_uid = _resolve_bound_user_id(actor, payload.user_id)
     try:
         session = InterviewSessionService.create(
             db=db,
@@ -343,14 +416,16 @@ def create_interview_session(
             max_questions=payload.max_questions,
             allow_external_ai=payload.allow_external_ai,
             research_consent=payload.research_consent,
-            user_id=payload.user_id,
+            user_id=bound_uid,
         )
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except SQLAlchemyError as exc:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to create interview session: {exc}") from exc
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create interview session: {exc}"
+        ) from exc
     return _session_response(session)
 
 
@@ -366,9 +441,9 @@ async def create_interview_session_from_cv_file(
     max_questions: int = Form(default=8, ge=5, le=15),
     allow_external_ai: bool = Form(default=True),
     research_consent: bool = Form(default=False),
+    actor: RequestActor = Depends(get_request_actor),
     db: Session = Depends(get_db),
 ) -> InterviewSessionResponse:
-    """Create an adaptive interview directly from an uploaded CV and JD text."""
     normalized_language = language.strip().lower()
     if normalized_language not in {"vi", "en"}:
         raise HTTPException(status_code=400, detail="language must be 'vi' or 'en'")
@@ -388,6 +463,7 @@ async def create_interview_session_from_cv_file(
             max_questions=max_questions,
             allow_external_ai=allow_external_ai,
             research_consent=research_consent,
+            user_id=actor.user_id,
         )
     except ValueError as exc:
         db.rollback()
@@ -400,7 +476,9 @@ async def create_interview_session_from_cv_file(
         ) from exc
     except Exception as exc:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to read CV file: {exc}") from exc
+        raise HTTPException(
+            status_code=500, detail=f"Failed to read CV file: {exc}"
+        ) from exc
 
     return _session_response(session)
 
@@ -412,6 +490,7 @@ async def create_interview_session_from_cv_file(
 )
 def create_synthetic_interview_session(
     payload: SyntheticInterviewSessionCreateRequest,
+    _: RequestActor = Depends(require_staff),
     db: Session = Depends(get_db),
 ) -> InterviewSessionResponse:
     context = SyntheticInterviewContextService.generate(
@@ -442,38 +521,120 @@ def create_synthetic_interview_session(
 @router.get("/sessions", response_model=list[InterviewSessionResponse])
 def list_all_sessions(
     limit: int = 100,
+    _: RequestActor = Depends(require_staff),
     db: Session = Depends(get_db),
 ) -> list[InterviewSessionResponse]:
     sessions = InterviewSessionService.list_all(db, limit=limit)
-    return [_session_response(s, include_candidates=False) for s in sessions]
+    reviews_map = _load_reviews_map(db, [s.session_id for s in sessions])
+    users_map = _load_users_map(db, [getattr(s, "user_id", None) for s in sessions])
+    return [
+        _session_response(
+            s,
+            include_candidates=False,
+            review=reviews_map.get(s.session_id),
+            user=users_map.get(getattr(s, "user_id", None)),
+        )
+        for s in sessions
+    ]
 
 
 @router.get("/users/{user_id}/sessions", response_model=list[InterviewSessionResponse])
 def list_user_sessions(
     user_id: int,
+    actor: RequestActor = Depends(get_request_actor),
     db: Session = Depends(get_db),
 ) -> list[InterviewSessionResponse]:
+    if not actor.is_staff and actor.user_id != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Bạn chỉ được xem danh sách phiên phỏng vấn của chính mình.",
+        )
     sessions = InterviewSessionService.list_for_user(db, user_id)
-    return [_session_response(s, include_candidates=False) for s in sessions]
+    reviews_map = _load_reviews_map(db, [s.session_id for s in sessions])
+    users_map = _load_users_map(db, [user_id])
+    owner = users_map.get(user_id)
+    return [
+        _session_response(
+            s,
+            include_candidates=False,
+            review=reviews_map.get(s.session_id),
+            user=owner,
+        )
+        for s in sessions
+    ]
 
 
 @router.get("/sessions/{session_id}", response_model=InterviewSessionResponse)
 def get_interview_session(
     session_id: str,
+    actor: RequestActor = Depends(get_request_actor),
     db: Session = Depends(get_db),
 ) -> InterviewSessionResponse:
     session = InterviewSessionService.get(db, session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Interview session not found")
-    return _session_response(session)
+    assert_session_access(session, actor)
+    _ensure_gaze_and_review_tables(db)
+    reviews_map = _load_reviews_map(db, [session.session_id])
+    users_map = _load_users_map(db, [getattr(session, "user_id", None)])
+    return _session_response(
+        session,
+        review=reviews_map.get(session.session_id),
+        user=users_map.get(getattr(session, "user_id", None)),
+    )
+
+
+@router.delete("/sessions/{session_id}", status_code=status.HTTP_200_OK)
+def delete_interview_session(
+    session_id: str,
+    actor: RequestActor = Depends(get_request_actor),
+    db: Session = Depends(get_db),
+) -> dict:
+    session = InterviewSessionService.get(db, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Interview session not found")
+    assert_session_access(session, actor)
+
+    try:
+        for child_model in (
+            InterviewEvidenceSummary,
+            InterviewGazeReport,
+            InterviewReview,
+            CandidateEvaluation,
+            ExpertAnnotation,
+            InterviewTurn,
+        ):
+            try:
+                with db.begin_nested():
+                    db.query(child_model).filter(
+                        child_model.session_id == session_id
+                    ).delete(synchronize_session=False)
+            except SQLAlchemyError:
+                pass
+        db.query(InterviewSession).filter(
+            InterviewSession.session_id == session_id
+        ).delete(synchronize_session=False)
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to delete interview session: {exc}"
+        ) from exc
+    return {"status": "deleted", "session_id": session_id}
 
 
 @router.post("/sessions/{session_id}/answers", response_model=InterviewSessionResponse)
 def submit_interview_answer(
     session_id: str,
     payload: InterviewAnswerRequest,
+    actor: RequestActor = Depends(get_request_actor),
     db: Session = Depends(get_db),
 ) -> InterviewSessionResponse:
+    existing = InterviewSessionService.get(db, session_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Interview session not found")
+    assert_session_access(existing, actor)
+
     try:
         session = InterviewSessionService.submit_answer(db, session_id, payload.answer)
     except ValueError as exc:
@@ -482,8 +643,192 @@ def submit_interview_answer(
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     except SQLAlchemyError as exc:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to save interview answer: {exc}") from exc
+        raise HTTPException(
+            status_code=500, detail=f"Failed to save interview answer: {exc}"
+        ) from exc
     return _session_response(session)
+
+
+# ============================================================================
+# Eye-Gaze Persistence Endpoints
+# ============================================================================
+
+
+@router.put("/sessions/{session_id}/gaze", response_model=InterviewGazeReportResponse)
+def upsert_session_gaze_report(
+    session_id: str,
+    payload: InterviewGazeReportRequest,
+    actor: RequestActor = Depends(get_request_actor),
+    db: Session = Depends(get_db),
+) -> InterviewGazeReportResponse:
+    session = InterviewSessionService.get(db, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Interview session not found")
+    assert_session_access(session, actor)
+    _ensure_gaze_and_review_tables(db)
+
+    sanitized_events: list[dict] = []
+    snapshot_count = 0
+    for ev in payload.gaze_events[:60]:
+        ev_dict = ev.model_dump(mode="json")
+        snap = ev_dict.get("snapshot")
+        if snap:
+            if snapshot_count >= _MAX_GAZE_SNAPSHOT_EVENTS or len(snap) > _MAX_SNAPSHOT_DATA_LEN:
+                ev_dict["snapshot"] = None
+            else:
+                snapshot_count += 1
+        sanitized_events.append(ev_dict)
+
+    now = datetime.now(timezone.utc)
+    try:
+        report = (
+            db.query(InterviewGazeReport)
+            .filter(InterviewGazeReport.session_id == session_id)
+            .first()
+        )
+        if report is None:
+            report = InterviewGazeReport(
+                session_id=session_id,
+                created_at=now,
+            )
+            db.add(report)
+
+        report.total_frames = payload.total_frames
+        report.face_frames = payload.face_frames
+        report.duration_sec = payload.duration_sec
+        report.camera_active = payload.camera_active
+        report.face_presence_pct = payload.face_presence_pct
+        report.gaze_center_pct = payload.gaze_center_pct
+        report.gaze_left_pct = payload.gaze_left_pct
+        report.gaze_right_pct = payload.gaze_right_pct
+        report.gaze_away_pct = payload.gaze_away_pct
+        report.gaze_events_json = sanitized_events
+        report.gaze_timeline_json = payload.gaze_timeline[:300]
+        report.integrity_score = payload.integrity_score
+        report.integrity_rank = payload.integrity_rank
+        report.integrity_summary_json = payload.integrity_summary
+        report.updated_at = now
+        db.commit()
+        db.refresh(report)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to save gaze report: {exc}"
+        ) from exc
+    return _gaze_response(report)
+
+
+@router.get("/sessions/{session_id}/gaze", response_model=InterviewGazeReportResponse)
+def get_session_gaze_report(
+    session_id: str,
+    actor: RequestActor = Depends(get_request_actor),
+    db: Session = Depends(get_db),
+) -> InterviewGazeReportResponse:
+    session = InterviewSessionService.get(db, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Interview session not found")
+    assert_session_access(session, actor)
+    _ensure_gaze_and_review_tables(db)
+
+    report = (
+        db.query(InterviewGazeReport)
+        .filter(InterviewGazeReport.session_id == session_id)
+        .first()
+    )
+    if not report:
+        raise HTTPException(status_code=404, detail="Gaze report not found for this session")
+    return _gaze_response(report)
+
+
+# ============================================================================
+# HR Review / Shortlist Endpoints (Admin & Recruiter)
+# ============================================================================
+
+
+@router.get("/sessions/{session_id}/review", response_model=InterviewReviewResponse)
+def get_session_review(
+    session_id: str,
+    _: RequestActor = Depends(require_staff),
+    db: Session = Depends(get_db),
+) -> InterviewReviewResponse:
+    session = InterviewSessionService.get(db, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Interview session not found")
+    review = (
+        db.query(InterviewReview)
+        .filter(InterviewReview.session_id == session_id)
+        .first()
+    )
+    if not review:
+        return InterviewReviewResponse(
+            session_id=session_id,
+            shortlisted=False,
+            decision="pending",
+            hr_notes=None,
+        )
+    return _review_response(review, session_id)
+
+
+@router.put("/sessions/{session_id}/review", response_model=InterviewReviewResponse)
+def upsert_session_review(
+    session_id: str,
+    payload: InterviewReviewRequest,
+    actor: RequestActor = Depends(require_staff),
+    db: Session = Depends(get_db),
+) -> InterviewReviewResponse:
+    session = InterviewSessionService.get(db, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Interview session not found")
+    _ensure_gaze_and_review_tables(db)
+
+    now = datetime.now(timezone.utc)
+    try:
+        review = (
+            db.query(InterviewReview)
+            .filter(InterviewReview.session_id == session_id)
+            .first()
+        )
+        if review is None:
+            review = InterviewReview(
+                session_id=session_id,
+                shortlisted=False,
+                decision="pending",
+                created_at=now,
+            )
+            db.add(review)
+
+        if payload.shortlisted is not None:
+            review.shortlisted = payload.shortlisted
+            if payload.decision is None:
+                if payload.shortlisted and review.decision == "pending":
+                    review.decision = "shortlisted"
+                elif not payload.shortlisted and review.decision == "shortlisted":
+                    review.decision = "pending"
+
+        if payload.decision is not None:
+            review.decision = payload.decision
+            if payload.shortlisted is None and payload.decision == "shortlisted":
+                review.shortlisted = True
+
+        if payload.hr_notes is not None:
+            review.hr_notes = payload.hr_notes.strip() or None
+
+        review.reviewed_by_user_id = actor.user_id
+        review.reviewed_by_email = actor.email or None
+        review.updated_at = now
+        db.commit()
+        db.refresh(review)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to save HR review: {exc}"
+        ) from exc
+    return _review_response(review, session_id)
+
+
+# ============================================================================
+# Evidence Summary, Evaluations, Expert Annotations, Context Extraction
+# ============================================================================
 
 
 @router.post(
@@ -492,11 +837,14 @@ def submit_interview_answer(
 )
 def create_interview_evidence_summary(
     session_id: str,
+    actor: RequestActor = Depends(get_request_actor),
     db: Session = Depends(get_db),
 ) -> InterviewEvidenceSummaryResponse:
     session = InterviewSessionService.get(db, session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Interview session not found")
+    assert_session_access(session, actor)
+    _ensure_gaze_and_review_tables(db)
     try:
         summary = InterviewEvidenceSummaryService.create_or_update(db, session)
     except SQLAlchemyError as exc:
@@ -514,10 +862,14 @@ def create_interview_evidence_summary(
 )
 def get_interview_evidence_summary(
     session_id: str,
+    actor: RequestActor = Depends(get_request_actor),
     db: Session = Depends(get_db),
 ) -> InterviewEvidenceSummaryResponse:
-    if not InterviewSessionService.get(db, session_id):
+    session = InterviewSessionService.get(db, session_id)
+    if not session:
         raise HTTPException(status_code=404, detail="Interview session not found")
+    assert_session_access(session, actor)
+    _ensure_gaze_and_review_tables(db)
     summary = InterviewEvidenceSummaryService.get(db, session_id)
     if not summary:
         raise HTTPException(status_code=404, detail="Interview evidence summary not found")
@@ -532,8 +884,14 @@ def get_interview_evidence_summary(
 def evaluate_candidate(
     session_id: str,
     payload: CandidateEvaluationRequest,
+    actor: RequestActor = Depends(get_request_actor),
     db: Session = Depends(get_db),
 ) -> CandidateEvaluationResponse:
+    session = InterviewSessionService.get(db, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Interview session not found")
+    assert_session_access(session, actor)
+    _ensure_gaze_and_review_tables(db)
     try:
         evaluation = CandidateEvaluationService.create(db, session_id, payload.model_name)
     except ValueError as exc:
@@ -545,7 +903,9 @@ def evaluate_candidate(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except SQLAlchemyError as exc:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to save candidate evaluation: {exc}") from exc
+        raise HTTPException(
+            status_code=500, detail=f"Failed to save candidate evaluation: {exc}"
+        ) from exc
     return _evaluation_response(evaluation)
 
 
@@ -555,10 +915,14 @@ def evaluate_candidate(
 )
 def list_candidate_evaluations(
     session_id: str,
+    actor: RequestActor = Depends(get_request_actor),
     db: Session = Depends(get_db),
 ) -> list[CandidateEvaluationResponse]:
-    if not InterviewSessionService.get(db, session_id):
+    session = InterviewSessionService.get(db, session_id)
+    if not session:
         raise HTTPException(status_code=404, detail="Interview session not found")
+    assert_session_access(session, actor)
+    _ensure_gaze_and_review_tables(db)
     return [
         _evaluation_response(item)
         for item in CandidateEvaluationService.list_for_session(db, session_id)
@@ -572,6 +936,7 @@ def list_candidate_evaluations(
 def save_expert_annotation(
     session_id: str,
     payload: ExpertAnnotationRequest,
+    _: RequestActor = Depends(require_staff),
     db: Session = Depends(get_db),
 ) -> ExpertAnnotationResponse:
     try:
@@ -588,7 +953,9 @@ def save_expert_annotation(
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     except SQLAlchemyError as exc:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to save expert annotation: {exc}") from exc
+        raise HTTPException(
+            status_code=500, detail=f"Failed to save expert annotation: {exc}"
+        ) from exc
     return _annotation_response(annotation)
 
 
@@ -598,6 +965,7 @@ def save_expert_annotation(
 )
 def get_expert_consensus(
     session_id: str,
+    _: RequestActor = Depends(require_staff),
     db: Session = Depends(get_db),
 ) -> ExpertConsensusResponse:
     if not InterviewSessionService.get(db, session_id):
@@ -615,9 +983,19 @@ def _extract_context(
     allow_external_ai: bool = False,
 ) -> InterviewContextResponse:
     try:
-        extraction_cv = AdaptiveQuestionEngine.redact_personal_data(cv_text) if allow_external_ai else cv_text
-        extraction_jd = AdaptiveQuestionEngine.redact_personal_data(jd_text) if allow_external_ai else jd_text
-        cv_profile = CvIngestService.extract_profile(db, extraction_cv, use_ai=allow_external_ai)
+        extraction_cv = (
+            AdaptiveQuestionEngine.redact_personal_data(cv_text)
+            if allow_external_ai
+            else cv_text
+        )
+        extraction_jd = (
+            AdaptiveQuestionEngine.redact_personal_data(jd_text)
+            if allow_external_ai
+            else jd_text
+        )
+        cv_profile = CvIngestService.extract_profile(
+            db, extraction_cv, use_ai=allow_external_ai
+        )
         job_profile = CvIngestService.build_uploaded_job_context(
             db,
             extraction_jd,
@@ -640,6 +1018,7 @@ def _extract_context(
 @router.post("/extract-context", response_model=InterviewContextResponse)
 def extract_interview_context(
     payload: InterviewContextRequest,
+    _: RequestActor = Depends(get_request_actor),
     db: Session = Depends(get_db),
 ) -> InterviewContextResponse:
     """Extract CV and JD independently without computing a match score."""
@@ -656,6 +1035,7 @@ async def extract_interview_context_files(
     cv_file: UploadFile = File(..., description="CV: PDF, DOCX, TXT, or MD"),
     jd_file: UploadFile = File(..., description="JD: PDF, DOCX, TXT, MD, PNG, JPG, or WebP"),
     allow_external_ai: bool = Form(default=False),
+    _: RequestActor = Depends(get_request_actor),
     db: Session = Depends(get_db),
 ) -> InterviewContextResponse:
     """Read uploaded CV/JD files and return structured interview context only."""
@@ -675,6 +1055,8 @@ async def extract_interview_context_files(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to read uploaded files: {exc}") from exc
+        raise HTTPException(
+            status_code=500, detail=f"Failed to read uploaded files: {exc}"
+        ) from exc
 
     return _extract_context(db, cv_text, jd_text, jd_file.filename, allow_external_ai)

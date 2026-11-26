@@ -15,6 +15,8 @@ from sqlalchemy.orm import Session, defer, selectinload
 from app.core.config import settings
 from app.models.interview_session import InterviewSession
 from app.models.interview_turn import InterviewTurn
+from app.models.interview_gaze_report import InterviewGazeReport  # noqa: F401
+from app.models.interview_review import InterviewReview  # noqa: F401
 from app.research.rubrics import CANDIDATE_EVALUATION_RUBRIC
 from app.services.llm_provider_service import (
     LLMJsonResult,
@@ -641,6 +643,9 @@ class AdaptiveQuestionEngine:
                 }
             )
 
+        scores = list(scores[: len(successful)])
+        while len(scores) < len(successful):
+            scores.append(0.0)
         selected_index = max(range(len(scores)), key=scores.__getitem__)
         selected = successful[selected_index][0]
         for index, (_candidate, payload) in enumerate(successful):

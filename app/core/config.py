@@ -8,7 +8,7 @@ BASE_DIR = Path(__file__).resolve().parents[2]
 
 
 class Settings(BaseSettings):
-    APP_NAME: str = "NextStep AI Interview Server"
+    APP_NAME: str = "PrepHire AI Interview Server"
     DEBUG: bool = True
     CORS_ORIGINS: str = (
         "http://localhost:5173,http://localhost:5174,http://localhost:8000,http://localhost:8002,"
@@ -134,6 +134,10 @@ class Settings(BaseSettings):
 
     JWT_ACCESS_SECRET: str
     JWT_ACCESS_EXPIRES_IN: str
+    JWT_SECRET: str = ""
+    JWT_ALGORITHM: str = "HS256"
+    INTERNAL_SERVICE_SECRET: str = ""
+    AUTH_ENFORCED: bool = True
 
     model_config = SettingsConfigDict(
         env_file=(BASE_DIR / ".env", BASE_DIR / ".env.production"),

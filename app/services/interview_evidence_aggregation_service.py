@@ -277,7 +277,7 @@ class InterviewEvidenceAggregator:
 
     @classmethod
     def aggregate(cls, session: InterviewSession) -> dict[str, Any]:
-        total_expected = max(session.max_questions or 5, len(session.turns))
+        total_expected = max(getattr(session, "max_questions", None) or 5, len(session.turns))
         all_turns = list(session.turns)
 
         # Phân loại chi tiết các câu trả lời
