@@ -176,12 +176,46 @@ def _session_response(
             for item in raw_candidates
             if item.get("question")
         ]
+        selected_raw = next(
+            (
+                item
+                for item in raw_candidates
+                if isinstance(item, dict) and item.get("selected")
+            ),
+            next(
+                (
+                    item
+                    for item in raw_candidates
+                    if isinstance(item, dict) and item.get("status") == "success"
+                ),
+                {},
+            ),
+        )
+        req_signals = [
+            str(s).strip()
+            for s in (selected_raw.get("required_signals") or [])
+            if str(s).strip()
+        ]
+        bon_signals = [
+            str(s).strip()
+            for s in (selected_raw.get("bonus_signals") or [])
+            if str(s).strip()
+        ]
         turns.append(
             InterviewTurnResponse(
                 turn_index=turn.turn_index,
                 stage=turn.stage,
+                criterion=getattr(turn, "criterion", None)
+                or selected_raw.get("criterion"),
+                expected_signal=getattr(turn, "expected_signal", None)
+                or selected_raw.get("expected_signal"),
+                question_type=selected_raw.get("question_type"),
+                difficulty=selected_raw.get("difficulty"),
+                required_signals=req_signals,
+                bonus_signals=bon_signals,
                 question=turn.question_text,
                 answer=turn.answer_text,
+                answer_word_count=getattr(turn, "answer_word_count", None),
                 question_source=turn.question_source,
                 provider_name=getattr(turn, "provider_name", None),
                 model_name=turn.model_name,

@@ -101,7 +101,14 @@ class InterviewQuestionCandidateResponse(BaseModel):
 
 
 class InterviewTurnResponse(InterviewQuestionResponse):
+    criterion: str | None = None
+    expected_signal: str | None = None
+    question_type: str | None = None
+    difficulty: int | None = None
+    required_signals: list[str] = Field(default_factory=list)
+    bonus_signals: list[str] = Field(default_factory=list)
     answer: str | None = None
+    answer_word_count: int | None = None
     question_source: str
     provider_name: str | None = None
     model_name: str | None = None
